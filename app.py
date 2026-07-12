@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Final
 
+import httpx
+import keyring
 from PySide6.QtCore import QSettings, QTimer, Qt
 from PySide6.QtGui import (
     QColor,
@@ -26,6 +29,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
@@ -42,6 +46,9 @@ ORGANIZATION_NAME: Final[str] = "Brad"
 DEFAULT_ROOT_LIST: Final[str] = "IMPORT SORTING"
 DEFAULT_TAGS: Final[str] = "!!-TAGGING-!!"
 MAX_RECENT_VALUES: Final[int] = 10
+KEYRING_SERVICE: Final[str] = "KKUpload"
+KEYRING_USERNAME: Final[str] = "karakeep_api_key"
+KARAKEEP_API_PREFIX: Final[str] = "/api/v1"
 
 SUPPORTED_EXTENSIONS: Final[set[str]] = {
     ".jpg",
@@ -154,6 +161,176 @@ class EditableHistoryField(QWidget):
 
         if selected:
             self.set_text(selected)
+
+
+class ConnectionSettingsDialog(QDialog):
+    """Collects and tests the Karakeep connection settings."""
+
+    def __init__(
+        self,
+        settings: QSettings,
+        parent: QWidget | None = None,
+        log_callback: Callable[[str, str], None] | None = None,
+    ) -> None:
+        super().__init__(parent)
+
+        self.settings = settings
+        self.log_callback = log_callback
+        self.setWindowTitle("Connection Settings")
+        self.setModal(True)
+        self.setMinimumWidth(380)
+
+        self.server_url_field = QLineEdit()
+        self.server_url_field.setPlaceholderText("https://bookmarks.example.com:8290")
+        self.server_url_field.setText(
+            str(self.settings.value("connection/server_url", "") or "")
+        )
+
+        self.api_key_field = QLineEdit()
+        self.api_key_field.setEchoMode(QLineEdit.EchoMode.Password)
+        self.api_key_field.setText(self._load_api_key())
+
+        self.show_key_checkbox = QCheckBox("Show")
+        self.show_key_checkbox.toggled.connect(self._update_key_visibility)
+
+        api_key_layout = QHBoxLayout()
+        api_key_layout.setContentsMargins(0, 0, 0, 0)
+        api_key_layout.addWidget(self.api_key_field, 1)
+        api_key_layout.addWidget(self.show_key_checkbox)
+
+        form_layout = QFormLayout()
+        form_layout.setFieldGrowthPolicy(
+            QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow
+        )
+        form_layout.addRow("Karakeep server:", self.server_url_field)
+        form_layout.addRow("API key:", api_key_layout)
+
+        self.button_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Cancel
+            | QDialogButtonBox.StandardButton.Save
+        )
+        self.test_button = QPushButton("Test Connection")
+        self.button_box.addButton(
+            self.test_button,
+            QDialogButtonBox.ButtonRole.ActionRole,
+        )
+
+        self.test_button.clicked.connect(self._test_connection)
+        self.button_box.accepted.connect(self._save_and_accept)
+        self.button_box.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form_layout)
+        layout.addWidget(self.button_box)
+        self.setFixedHeight(self.sizeHint().height())
+
+    @staticmethod
+    def normalized_server_url(server_url: str) -> str:
+        return server_url.strip().rstrip("/")
+
+    @classmethod
+    def api_base_url(cls, server_url: str) -> str:
+        return cls.normalized_server_url(server_url) + KARAKEEP_API_PREFIX
+
+    @staticmethod
+    def test_connection(server_url: str, api_key: str) -> tuple[bool, str]:
+        normalized_url = ConnectionSettingsDialog.normalized_server_url(server_url)
+        stripped_key = api_key.strip()
+
+        if not normalized_url:
+            return False, "Enter a Karakeep server URL."
+
+        if not (
+            normalized_url.startswith("http://")
+            or normalized_url.startswith("https://")
+        ):
+            return False, "Server URL must start with http:// or https://."
+
+        if not stripped_key:
+            return False, "Enter a Karakeep API key."
+
+        try:
+            response = httpx.get(
+                ConnectionSettingsDialog.api_base_url(normalized_url) + "/lists",
+                headers={"Authorization": f"Bearer {stripped_key}"},
+                timeout=10.0,
+            )
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code
+            return False, f"Connection failed: HTTP {status_code}."
+        except httpx.RequestError as exc:
+            return False, f"Connection failed: {exc}"
+
+        return True, "Connected to Karakeep."
+
+    def values(self) -> tuple[str, str]:
+        return (
+            self.normalized_server_url(self.server_url_field.text()),
+            self.api_key_field.text().strip(),
+        )
+
+    def _load_api_key(self) -> str:
+        try:
+            return keyring.get_password(KEYRING_SERVICE, KEYRING_USERNAME) or ""
+        except keyring.errors.KeyringError:
+            return ""
+
+    def _update_key_visibility(self, show_key: bool) -> None:
+        if show_key:
+            self.api_key_field.setEchoMode(QLineEdit.EchoMode.Normal)
+        else:
+            self.api_key_field.setEchoMode(QLineEdit.EchoMode.Password)
+
+    def _test_connection(self) -> None:
+        server_url, api_key = self.values()
+        if self.log_callback is not None:
+            self.log_callback(f"Testing Karakeep connection: {server_url}")
+        QApplication.processEvents()
+
+        success, message = self.test_connection(server_url, api_key)
+        if self.log_callback is not None:
+            level = "SUCCESS" if success else "ERROR"
+            self.log_callback(message, level)
+
+    def _save_and_accept(self) -> None:
+        server_url, api_key = self.values()
+
+        if not server_url:
+            self._show_error("Enter a Karakeep server URL.")
+            return
+
+        if not (
+            server_url.startswith("http://")
+            or server_url.startswith("https://")
+        ):
+            self._show_error("Server URL must start with http:// or https://.")
+            return
+
+        if not api_key:
+            self._show_error("Enter a Karakeep API key.")
+            return
+
+        try:
+            keyring.set_password(
+                KEYRING_SERVICE,
+                KEYRING_USERNAME,
+                api_key,
+            )
+        except keyring.errors.KeyringError as exc:
+            self._show_error(f"Unable to save API key:\n\n{exc}")
+            return
+
+        self.settings.setValue("connection/server_url", server_url)
+        self.settings.sync()
+        self.accept()
+
+    def _show_error(self, message: str) -> None:
+        QMessageBox.critical(
+            self,
+            "Invalid Connection Settings",
+            message,
+        )
 
 
 class UploadDialog(QDialog):
@@ -558,6 +735,11 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(APP_NAME)
         self.resize(900, 650)
 
+        self.connection_settings_button = QPushButton("Connection Settings")
+        self.connection_settings_button.clicked.connect(
+            self._open_connection_settings
+        )
+
         self.upload_button = QPushButton("Configure Upload")
         self.upload_button.clicked.connect(self._open_upload_dialog)
 
@@ -565,10 +747,17 @@ class MainWindow(QMainWindow):
         self.stop_button.setEnabled(False)
         self.stop_button.clicked.connect(self._request_stop)
 
+        self.connection_status_label = QLabel("Karakeep: Not configured")
+        self.connection_status_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+
         button_layout = QHBoxLayout()
+        button_layout.addWidget(self.connection_settings_button)
         button_layout.addWidget(self.upload_button)
         button_layout.addWidget(self.stop_button)
         button_layout.addStretch(1)
+        button_layout.addWidget(self.connection_status_label)
 
         self.console = StatusConsole(Path(__file__).with_name("naut.png"))
         self.console.setReadOnly(True)
@@ -601,9 +790,68 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central_widget)
 
         self._restore_window_state()
+        self._update_connection_state()
         self._log("KKUpload ready.")
+        QTimer.singleShot(0, self._prompt_for_connection_if_needed)
+
+    def _open_connection_settings(self) -> bool:
+        dialog = ConnectionSettingsDialog(
+            self.settings,
+            self,
+            log_callback=self._log,
+        )
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            self._log("Connection settings canceled.")
+            self._update_connection_state()
+            return False
+
+        self._log("Connection settings saved.")
+        self._update_connection_state()
+        return True
+
+    def _prompt_for_connection_if_needed(self) -> None:
+        if self._has_connection_settings():
+            return
+
+        self._log("Connection settings are required before uploading.")
+        self._open_connection_settings()
+
+    def _has_connection_settings(self) -> bool:
+        server_url = str(
+            self.settings.value("connection/server_url", "") or ""
+        ).strip()
+
+        try:
+            api_key = (
+                keyring.get_password(KEYRING_SERVICE, KEYRING_USERNAME)
+                or ""
+            )
+        except keyring.errors.KeyringError:
+            api_key = ""
+
+        return bool(server_url and api_key)
+
+    def _update_connection_state(self) -> None:
+        has_settings = self._has_connection_settings()
+        self.upload_button.setEnabled(has_settings and not self.is_running)
+
+        if has_settings:
+            server_url = str(
+                self.settings.value("connection/server_url", "") or ""
+            ).strip()
+            self.connection_status_label.setText(server_url)
+            self.connection_status_label.setContentsMargins(0, 0, 36, 0)
+        else:
+            self.connection_status_label.setText("Karakeep: Not configured")
+            self.connection_status_label.setContentsMargins(0, 0, 0, 0)
 
     def _open_upload_dialog(self) -> None:
+        if not self._has_connection_settings():
+            self._log("Configure Karakeep connection settings before uploading.")
+            self._open_connection_settings()
+            return
+
         dialog = UploadDialog(self.settings, self)
 
         if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -624,9 +872,21 @@ class MainWindow(QMainWindow):
             return
 
         if config.dry_run:
-            self._log("Starting simulated dry-run.")
+            self._log(
+                "STARTING SIMULATED DRY-RUN.",
+                message_color="START",
+            )
         else:
-            self._log("Starting simulated upload.")
+            self._log(
+                "STARTING SIMULATED UPLOAD.",
+                message_color="START",
+            )
+
+        self._log(
+            "================================",
+            message_color="START",
+            include_level=False,
+        )
 
         self.current_index = 0
         self.succeeded_count = 0
@@ -740,16 +1000,23 @@ class MainWindow(QMainWindow):
         self.timer.stop()
         self.is_running = False
 
-        self.upload_button.setEnabled(True)
+        self._update_connection_state()
         self.stop_button.setEnabled(False)
         self.stop_button.setText("Stop")
 
         if stopped:
             self.current_file_label.setText("Current file: stopped")
             self._log("Upload batch stopped.", level="WARNING")
+            self._log("================================", include_level=False)
         else:
             self.current_file_label.setText("Current file: complete")
-            self._log("Upload batch complete.", level="SUCCESS")
+            self._log(
+                "UPLOAD BATCH COMPLETE!",
+                level="SUCCESS",
+                message_color="SUCCESS",
+            )
+            self._log("================================", include_level=False)
+            self._log_completion_summary()
 
         self._update_summary()
 
@@ -759,13 +1026,43 @@ class MainWindow(QMainWindow):
             0,
         )
 
-        self.summary_label.setText(
-            f"Succeeded: {self.succeeded_count}    "
-            f"Failed: {self.failed_count}    "
-            f"Remaining: {remaining}"
-        )
+        if self.failed_count > 0:
+            error_color = self._console_log_colors()["ERROR"]
+            self.summary_label.setText(
+                f"Succeeded: {self.succeeded_count}&nbsp;&nbsp;&nbsp;&nbsp;"
+                f"Failed: <span style='color: {error_color};'>"
+                f"{self.failed_count}</span>&nbsp;&nbsp;&nbsp;&nbsp;"
+                f"Remaining: {remaining}"
+            )
+        else:
+            self.summary_label.setText(
+                f"Succeeded: {self.succeeded_count}    "
+                f"Failed: {self.failed_count}    "
+                f"Remaining: {remaining}"
+            )
 
-    def _log(self, message: str, level: str = "INFO") -> None:
+    def _log_completion_summary(self) -> None:
+        total = self.succeeded_count + self.failed_count
+        self._log(f"Successful: {self.succeeded_count} / {total}")
+
+        if self.failed_count > 0:
+            self._log(
+                f"Failed: {self.failed_count} / {total}",
+                message_color="ERROR",
+            )
+        else:
+            self._log(f"Failed: {self.failed_count} / {total}")
+
+        self._log("================================", include_level=False)
+
+    def _log(
+        self,
+        message: str,
+        level: str = "INFO",
+        message_color: str | None = None,
+        include_prefix: bool = True,
+        include_level: bool = True,
+    ) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
         colors = self._console_log_colors()
         default_format = QTextCharFormat()
@@ -778,15 +1075,27 @@ class MainWindow(QMainWindow):
             QColor(colors.get(level, colors["default"]))
         )
 
+        message_format = QTextCharFormat()
+        if message_color is not None:
+            message_format.setForeground(
+                QColor(colors.get(message_color, colors["default"]))
+            )
+
         cursor = self.console.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
 
         if not self.console.document().isEmpty():
             cursor.insertBlock()
 
-        cursor.insertText(f"[{timestamp}] ", timestamp_format)
-        cursor.insertText(f"[{level}] ", level_format)
-        cursor.insertText(message, default_format)
+        if include_prefix:
+            cursor.insertText(f"[{timestamp}] ", timestamp_format)
+            if include_level:
+                cursor.insertText(f"[{level}] ", level_format)
+
+        cursor.insertText(
+            message,
+            message_format if message_color is not None else default_format,
+        )
 
         scrollbar = self.console.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
@@ -801,6 +1110,9 @@ class MainWindow(QMainWindow):
                 "default": "#e5e7eb",
                 "SUCCESS": "#4ade80",
                 "ERROR": "#f87171",
+                "WARNING": "#facc15",
+                "GOLD": "#facc15",
+                "START": "#7dd3fc",
             }
 
         return {
@@ -808,6 +1120,9 @@ class MainWindow(QMainWindow):
             "default": "#111827",
             "SUCCESS": "#15803d",
             "ERROR": "#b91c1c",
+            "WARNING": "#ca8a04",
+            "GOLD": "#b45309",
+            "START": "#0284c7",
         }
 
     def _restore_window_state(self) -> None:
