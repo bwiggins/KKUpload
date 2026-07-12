@@ -391,7 +391,7 @@ class UploadDialog(QDialog):
             DEFAULT_ROOT_LIST,
         )
 
-        self.import_to_root_checkbox = QCheckBox("Import to root")
+        self.import_to_root_checkbox = QCheckBox("No import list")
         self.import_to_root_checkbox.setChecked(
             self.settings.value(
                 "upload/import_to_root",
@@ -565,7 +565,7 @@ class UploadDialog(QDialog):
 
         if not import_to_root and not root_list:
             self._show_error(
-                "Enter an Import to list value or select Import to root."
+                "Enter an Import to list value or select No import list."
             )
             return
 
@@ -887,6 +887,8 @@ class MainWindow(QMainWindow):
         self.succeeded_count = 0
         self.failed_count = 0
         self.not_processed_count = 0
+        self.resolved_conflict_count = 0
+        self.unsupported_count = 0
         self.failed_files: list[str] = []
         self.completed_operations = 0
         self.total_operations = 0
@@ -1089,6 +1091,8 @@ class MainWindow(QMainWindow):
         self.succeeded_count = 0
         self.failed_count = 0
         self.not_processed_count = 0
+        self.resolved_conflict_count = 0
+        self.unsupported_count = 0
         self.failed_files = []
         self.completed_operations = 0
         self.total_operations = 0
@@ -1146,7 +1150,7 @@ class MainWindow(QMainWindow):
         )
 
         if config.import_to_root:
-            self._log("Destination mode: import to Karakeep root.")
+            self._log("Destination mode: no import list.")
         else:
             self._log(
                 f"Destination root list: {config.root_list}"
@@ -1184,6 +1188,8 @@ class MainWindow(QMainWindow):
         self.worker.progress_range.connect(self._set_progress_range)
         self.worker.progress.connect(self._set_progress)
         self.worker.move_conflict.connect(self._handle_move_conflict)
+        self.worker.conflict_resolved.connect(self._handle_conflict_resolved)
+        self.worker.unsupported_found.connect(self._handle_unsupported_found)
         self.worker.failed_file.connect(self._handle_failed_file)
         self.worker.finished.connect(self._finish_batch)
         self.worker.finished.connect(self.worker_thread.quit)
@@ -1218,6 +1224,16 @@ class MainWindow(QMainWindow):
 
     def _handle_failed_file(self, relative_path: str) -> None:
         self.failed_files.append(relative_path)
+        self.failed_count += 1
+        self._update_summary()
+
+    def _handle_conflict_resolved(self, count: int) -> None:
+        self.resolved_conflict_count += count
+        self._update_summary()
+
+    def _handle_unsupported_found(self, count: int) -> None:
+        self.unsupported_count = count
+        self._update_summary()
 
     def _set_progress_range(self, total_operations: int, total_files: int) -> None:
         self.total_operations = total_operations
@@ -1234,7 +1250,7 @@ class MainWindow(QMainWindow):
     ) -> None:
         self.completed_operations = completed_operations
         self.current_index = processed_files
-        self.succeeded_count = processed_files
+        self.succeeded_count = max(processed_files - self.failed_count, 0)
         self.progress_bar.setValue(completed_operations)
         self.current_file_label.setText(
             f"Current operation: {current_operation}"
@@ -1293,6 +1309,7 @@ class MainWindow(QMainWindow):
         self.succeeded_count = succeeded
         self.failed_count = failed
         self.not_processed_count = not_processed
+        self.current_index = succeeded + failed
 
         self._update_connection_state()
         self.is_paused = False
@@ -1313,24 +1330,36 @@ class MainWindow(QMainWindow):
 
     def _update_summary(self) -> None:
         remaining = max(
-            self.total_files - self.succeeded_count,
+            self.total_files - self.current_index,
             0,
         )
-
+        colors = self._console_log_colors()
+        failed_text = str(self.failed_count)
         if self.failed_count > 0:
-            error_color = self._console_log_colors()["ERROR"]
-            self.summary_label.setText(
-                f"Succeeded: {self.succeeded_count}&nbsp;&nbsp;&nbsp;&nbsp;"
-                f"Failed: <span style='color: {error_color};'>"
-                f"{self.failed_count}</span>&nbsp;&nbsp;&nbsp;&nbsp;"
-                f"Remaining: {remaining}"
+            failed_text = (
+                f"<span style='color: {colors['ERROR']};'>"
+                f"{self.failed_count}</span>"
             )
-        else:
-            self.summary_label.setText(
-                f"Succeeded: {self.succeeded_count}    "
-                f"Failed: {self.failed_count}    "
-                f"Remaining: {remaining}"
-            )
+
+        self.summary_label.setText(
+            f"Succeeded: {self.succeeded_count}&nbsp;&nbsp;&nbsp;&nbsp;"
+            f"Failed: {failed_text}&nbsp;&nbsp;&nbsp;&nbsp;"
+            "Conflicts: "
+            f"<span style='color: {colors['WARNING']};'>"
+            f"{self.resolved_conflict_count}</span>&nbsp;&nbsp;&nbsp;&nbsp;"
+            f"Unsupported: {self._format_unsupported_count()}&nbsp;&nbsp;&nbsp;&nbsp;"
+            f"Remaining: {remaining}"
+        )
+
+    def _format_unsupported_count(self) -> str:
+        if self.unsupported_count <= 0:
+            return "0"
+
+        warning_color = self._console_log_colors()["WARNING"]
+        return (
+            f"<span style='color: {warning_color};'>"
+            f"{self.unsupported_count}</span>"
+        )
 
     def _log_completion_summary(
         self,

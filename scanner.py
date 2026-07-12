@@ -17,6 +17,7 @@ class ScannedFile:
 class ScanResult:
     scanned_folders: tuple[Path, ...]
     supported_files: tuple[ScannedFile, ...]
+    unsupported_files: tuple[Path, ...]
 
 
 def is_supported_file(path: Path) -> bool:
@@ -27,12 +28,17 @@ def scan_upload_folder(upload_folder: Path) -> ScanResult:
     upload_folder = upload_folder.resolve()
     scanned_folders: list[Path] = []
     supported_files: list[ScannedFile] = []
+    unsupported_files: list[Path] = []
 
     for current_folder in _walk_folders(upload_folder):
         scanned_folders.append(current_folder)
 
         for child in sorted(current_folder.iterdir(), key=lambda item: item.name.lower()):
+            if not child.is_file():
+                continue
+
             if not is_supported_file(child):
+                unsupported_files.append(child)
                 continue
 
             relative_path = child.relative_to(upload_folder)
@@ -54,6 +60,7 @@ def scan_upload_folder(upload_folder: Path) -> ScanResult:
     return ScanResult(
         scanned_folders=tuple(scanned_folders),
         supported_files=tuple(supported_files),
+        unsupported_files=tuple(unsupported_files),
     )
 
 

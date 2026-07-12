@@ -42,8 +42,8 @@ class SuccessfulUploadClient:
         self.created_bookmarks: list[tuple[str, str]] = []
         self.assigned_lists: list[tuple[str, str]] = []
         self.attached_tags: list[tuple[str, tuple[str, ...]]] = []
-        self.bookmark_id = "bookmark-1"
-        self.asset_id = "asset-1"
+        self.bookmark_counter = 0
+        self.asset_counter = 0
 
     def list_lists(self) -> tuple[ListRecord, ...]:
         return tuple(self.records.values())
@@ -66,7 +66,8 @@ class SuccessfulUploadClient:
 
     def upload_asset(self, file_path: Path) -> dict:
         self.uploaded_files.append(file_path)
-        return {"assetId": self.asset_id}
+        self.asset_counter += 1
+        return {"assetId": f"asset-{self.asset_counter}"}
 
     def create_asset_bookmark(
         self,
@@ -74,8 +75,10 @@ class SuccessfulUploadClient:
         asset_id: str,
         file_name: str,
     ) -> dict:
+        self.bookmark_counter += 1
+        bookmark_id = f"bookmark-{self.bookmark_counter}"
         self.created_bookmarks.append((asset_id, file_name))
-        return {"id": self.bookmark_id}
+        return {"id": bookmark_id}
 
     def add_bookmark_to_list(self, *, list_id: str, bookmark_id: str) -> None:
         self.assigned_lists.append((list_id, bookmark_id))
@@ -91,7 +94,7 @@ class SuccessfulUploadClient:
     def get_bookmark(self, bookmark_id: str) -> dict:
         return {
             "id": bookmark_id,
-            "content": {"assetId": self.asset_id},
+            "content": {"assetId": bookmark_id.replace("bookmark", "asset")},
             "tags": [
                 {"name": tag_name}
                 for _, tag_names in self.attached_tags
@@ -202,7 +205,45 @@ class UploadWorkerTests(unittest.TestCase):
             self.assertEqual(progress_values[-1][0], 6)
             self.assertEqual(progress_values[-1][2], 2)
 
-    def test_live_upload_processes_first_file_only(self) -> None:
+    def test_dry_run_counts_move_conflicts_as_resolved(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            upload_folder = root / "upload"
+            completed_folder = root / "completed"
+            upload_folder.mkdir()
+            completed_folder.mkdir()
+            (upload_folder / "image.jpg").write_text("new")
+            (completed_folder / "image.jpg").write_text("existing")
+
+            worker = UploadWorker(
+                UploadJobConfig(
+                    server_url="https://karakeep.example.test",
+                    api_key="token",
+                    upload_folder=upload_folder,
+                    completed_folder=completed_folder,
+                    error_folder=root / "errors",
+                    dont_move_completed=False,
+                    dont_move_failed=False,
+                    dont_preserve_move_structure=False,
+                    move_conflict_mode="ask",
+                    import_to_root=False,
+                    root_list="IMPORT SORTING",
+                    default_tags=(),
+                    dry_run=True,
+                ),
+                client=EmptyDryRunClient(),
+            )
+
+            resolved_conflicts: list[int] = []
+            worker.conflict_resolved.connect(resolved_conflicts.append)
+
+            worker.run()
+
+            self.assertEqual(sum(resolved_conflicts), 1)
+            self.assertTrue((upload_folder / "image.jpg").exists())
+            self.assertEqual((completed_folder / "image.jpg").read_text(), "existing")
+
+    def test_live_upload_processes_all_files(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             upload_folder = Path(temp_dir)
             completed_folder = Path(temp_dir) / "completed"
@@ -240,27 +281,40 @@ class UploadWorkerTests(unittest.TestCase):
 
             worker.run()
 
-            self.assertEqual(finished_values, [(False, 1, 0, 1)])
+            self.assertEqual(finished_values, [(False, 2, 0, 0)])
             self.assertEqual(client.created_lists, [("IMPORT SORTING", None)])
             self.assertEqual(
                 client.uploaded_files,
-                [(upload_folder / "alpha.jpg").resolve()],
+                [
+                    (upload_folder / "alpha.jpg").resolve(),
+                    (upload_folder / "beta.jpg").resolve(),
+                ],
             )
             self.assertEqual(
                 client.created_bookmarks,
-                [("asset-1", "alpha.jpg")],
+                [
+                    ("asset-1", "alpha.jpg"),
+                    ("asset-2", "beta.jpg"),
+                ],
             )
             self.assertEqual(
                 client.assigned_lists,
-                [("list-1", "bookmark-1")],
+                [
+                    ("list-1", "bookmark-1"),
+                    ("list-1", "bookmark-2"),
+                ],
             )
             self.assertEqual(
                 client.attached_tags,
-                [("bookmark-1", ("!!-TAGGING-!!", "figure"))],
+                [
+                    ("bookmark-1", ("!!-TAGGING-!!", "figure")),
+                    ("bookmark-2", ("!!-TAGGING-!!", "figure")),
+                ],
             )
             self.assertFalse((upload_folder / "alpha.jpg").exists())
             self.assertTrue((completed_folder / "alpha.jpg").exists())
-            self.assertTrue((upload_folder / "beta.jpg").exists())
+            self.assertFalse((upload_folder / "beta.jpg").exists())
+            self.assertTrue((completed_folder / "beta.jpg").exists())
 
     def test_live_upload_preserves_relative_move_structure(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -484,7 +538,7 @@ class UploadWorkerTests(unittest.TestCase):
 
             worker.run()
 
-            self.assertEqual(finished_values, [(True, 0, 1, 0)])
+            self.assertEqual(finished_values, [(False, 0, 1, 0)])
             self.assertFalse((nested_folder / "poop.jpg").exists())
             self.assertTrue(
                 (error_folder / "fart" / "burp" / "poop.jpg").exists()

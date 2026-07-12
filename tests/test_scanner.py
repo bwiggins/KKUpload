@@ -28,6 +28,11 @@ class ScannerTests(unittest.TestCase):
                 result.supported_files[1].folder_parts,
                 ("Models", "Rose"),
             )
+            unsupported_paths = {
+                str(path.relative_to(root)).replace("\\", "/")
+                for path in result.unsupported_files
+            }
+            self.assertEqual(unsupported_paths, {"ignore.txt"})
 
     def test_rejects_any_nested_folder_relationship(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

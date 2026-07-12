@@ -101,6 +101,8 @@ class UploadWorker(QObject):
     progress_range = Signal(int, int)
     progress = Signal(int, str, int)
     move_conflict = Signal(object)
+    conflict_resolved = Signal(int)
+    unsupported_found = Signal(int)
     failed_file = Signal(str)
     finished = Signal(bool, int, int, int)
 
@@ -142,22 +144,16 @@ class UploadWorker(QObject):
             )
 
             total_files = len(plan.planned_files)
-            first_file = plan.planned_files[0] if plan.planned_files else None
             required_lists = plan.required_lists
             pipeline_operation_count = total_files
 
             if not self.config.dry_run:
-                required_lists = self._required_lists_for_destination(
-                    plan.required_lists,
-                    first_file.destination_path if first_file else None,
-                )
-                pipeline_operation_count = (
-                    self._single_file_pipeline_operation_count(
-                        first_file,
+                pipeline_operation_count = sum(
+                    self._file_pipeline_operation_count(
+                        planned_file,
                         move_kind="completed",
                     )
-                    if first_file is not None
-                    else 0
+                    for planned_file in plan.planned_files
                 )
 
             total_operations = (
@@ -199,7 +195,7 @@ class UploadWorker(QObject):
                 return
 
             if self.config.dry_run:
-                succeeded, completed_operations, processed_files = (
+                result = (
                     self._report_dry_run_files(
                         plan.planned_files,
                         total_files,
@@ -207,27 +203,37 @@ class UploadWorker(QObject):
                         processed_files,
                     )
                 )
-                if succeeded is None:
+                if result[0] is None:
                     not_processed = total_files - processed_files
                     self.finished.emit(True, 0, failed, not_processed)
                     return
-            elif first_file is not None:
-                result = self._upload_single_file(
+
+                succeeded, completed_operations, processed_files = result
+            elif plan.planned_files:
+                result = self._upload_files(
                     client,
                     list_index,
-                    first_file,
+                    plan.planned_files,
                     total_files,
                     completed_operations,
                     processed_files,
                 )
                 if result is None:
-                    failed = 1
-                    not_processed = max(total_files - processed_files - 1, 0)
+                    not_processed = max(total_files - processed_files, 0)
                     self.finished.emit(True, succeeded, failed, not_processed)
                     return
 
-                succeeded, completed_operations, processed_files = result
+                (
+                    succeeded,
+                    failed,
+                    completed_operations,
+                    processed_files,
+                    stopped,
+                ) = result
                 not_processed = max(total_files - processed_files, 0)
+                if stopped:
+                    self.finished.emit(True, succeeded, failed, not_processed)
+                    return
             else:
                 self._log("No supported files found.")
 
@@ -241,6 +247,8 @@ class UploadWorker(QObject):
         self._log(f"Scanning upload folder: {self.config.upload_folder}")
         scan_result = scan_upload_folder(self.config.upload_folder)
         self._log(f"Found {len(scan_result.supported_files)} supported files.")
+        self._log(f"Found {len(scan_result.unsupported_files)} unsupported files.")
+        self.unsupported_found.emit(len(scan_result.unsupported_files))
         return scan_result
 
     @staticmethod
@@ -249,28 +257,14 @@ class UploadWorker(QObject):
             return "."
         return str(Path(*folder_parts))
 
-    @staticmethod
-    def _required_lists_for_destination(
-        required_lists: tuple[RequiredList, ...],
-        destination_path: tuple[str, ...] | None,
-    ) -> tuple[RequiredList, ...]:
-        if not destination_path:
-            return ()
-
-        return tuple(
-            required_list
-            for required_list in required_lists
-            if required_list.path == destination_path[: len(required_list.path)]
-        )
-
-    def _single_file_pipeline_operation_count(
+    def _file_pipeline_operation_count(
         self,
-        first_file,
+        file,
         *,
         move_kind: str,
     ) -> int:
         operations = 3  # upload asset, create bookmark, verify
-        if first_file.destination_path:
+        if file.destination_path:
             operations += 1
         if self.config.default_tags:
             operations += 1
@@ -322,23 +316,65 @@ class UploadWorker(QObject):
 
         return succeeded, completed_operations, processed_files
 
-    def _upload_single_file(
+    def _upload_files(
+        self,
+        client: ClientProtocol,
+        list_index: ListIndex,
+        planned_files,
+        total_files: int,
+        completed_operations: int,
+        processed_files: int,
+    ) -> tuple[int, int, int, int, bool] | None:
+        succeeded = 0
+        failed = 0
+
+        for file in planned_files:
+            if self._stop_requested:
+                return succeeded, failed, completed_operations, processed_files, True
+
+            while self._paused and not self._stop_requested:
+                QThread.msleep(100)
+
+            if self._stop_requested:
+                return succeeded, failed, completed_operations, processed_files, True
+
+            result = self._upload_file(
+                client,
+                list_index,
+                file,
+                completed_operations,
+                processed_files,
+            )
+            if result is None:
+                failed += 1
+                return succeeded, failed, completed_operations, processed_files, True
+
+            file_succeeded, completed_operations, processed_files = result
+            if file_succeeded:
+                succeeded += 1
+            else:
+                failed += 1
+                if self._stop_requested:
+                    return (
+                        succeeded,
+                        failed,
+                        completed_operations,
+                        processed_files,
+                        True,
+                    )
+
+        return succeeded, failed, completed_operations, processed_files, False
+
+    def _upload_file(
         self,
         client: ClientProtocol,
         list_index: ListIndex,
         file,
-        total_files: int,
         completed_operations: int,
         processed_files: int,
-    ) -> tuple[int, int, int] | None:
-        if self._stop_requested:
-            return None
-
+    ) -> tuple[bool, int, int] | None:
         destination = format_list_path(file.destination_path)
-        self._log(
-            "Uploading first supported file only for this milestone: "
-            f"{file.file_path}"
-        )
+        self._log(f"Uploading supported file: {file.file_path}")
         self._log(f"Destination list: {destination}")
 
         try:
@@ -427,7 +463,7 @@ class UploadWorker(QObject):
             self._log(f"Verification complete: {bookmark_id}", level="SUCCESS")
             move_destination = self._move_processed_file(file, "completed")
             if self._stop_requested:
-                return None
+                return False, completed_operations, processed_files
             if move_destination is not None:
                 completed_operations += 1
                 self.progress.emit(
@@ -444,7 +480,14 @@ class UploadWorker(QObject):
             )
             self.failed_file.emit(str(file.file_path))
             self._try_move_failed_file(file)
-            return None
+            processed_files += 1
+            completed_operations += 1
+            self.progress.emit(
+                completed_operations,
+                f"Handled failed file: {file.file_path}",
+                processed_files,
+            )
+            return False, completed_operations, processed_files
         except Exception as exc:  # noqa: BLE001
             self._log(
                 f"Upload failed: {file.file_path} ({exc})",
@@ -453,15 +496,16 @@ class UploadWorker(QObject):
             )
             self.failed_file.emit(str(file.file_path))
             self._try_move_failed_file(file)
-            return None
-
-        if total_files > 1:
-            self._log(
-                "Single-file milestone complete. "
-                f"{total_files - 1} supported files were not processed."
+            processed_files += 1
+            completed_operations += 1
+            self.progress.emit(
+                completed_operations,
+                f"Handled failed file: {file.file_path}",
+                processed_files,
             )
+            return False, completed_operations, processed_files
 
-        return 1, completed_operations, processed_files
+        return True, completed_operations, processed_files
 
     def _try_move_failed_file(self, file) -> None:
         try:
@@ -483,6 +527,7 @@ class UploadWorker(QObject):
 
         destination = self._move_destination_for_file(file, root_folder)
         if destination.exists():
+            self.conflict_resolved.emit(1)
             if self.config.move_conflict_mode == "rename":
                 destination = self._available_destination_path(destination)
                 self._log(
@@ -559,16 +604,22 @@ class UploadWorker(QObject):
                 f"'{self.config.move_conflict_mode}': {destination_path}",
                 level="WARNING",
             )
-            return self._apply_move_conflict_choice(
+            result = self._apply_move_conflict_choice(
                 self.config.move_conflict_mode,
                 destination_path,
             )
+            if result is not None:
+                self.conflict_resolved.emit(1)
+            return result
 
         if self._move_conflict_policy is not None:
-            return self._apply_move_conflict_choice(
+            result = self._apply_move_conflict_choice(
                 self._move_conflict_policy,
                 destination_path,
             )
+            if result is not None:
+                self.conflict_resolved.emit(1)
+            return result
 
         request = MoveConflictRequest(
             source_path=source_path,
@@ -592,10 +643,13 @@ class UploadWorker(QObject):
         if request.apply_to_all and request.choice in {"overwrite", "rename"}:
             self._move_conflict_policy = request.choice
 
-        return self._apply_move_conflict_choice(
+        result = self._apply_move_conflict_choice(
             request.choice,
             destination_path,
         )
+        if result is not None:
+            self.conflict_resolved.emit(1)
+        return result
 
     def _apply_move_conflict_choice(
         self,
