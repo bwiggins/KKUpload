@@ -30,7 +30,7 @@ class UploadJobConfig:
     dont_move_completed: bool
     dont_move_failed: bool
     dont_preserve_move_structure: bool
-    rename_move_conflicts: bool
+    move_conflict_mode: str
     import_to_root: bool
     root_list: str
     default_tags: tuple[str, ...]
@@ -101,6 +101,7 @@ class UploadWorker(QObject):
     progress_range = Signal(int, int)
     progress = Signal(int, str, int)
     move_conflict = Signal(object)
+    failed_file = Signal(str)
     finished = Signal(bool, int, int, int)
 
     def __init__(
@@ -307,7 +308,7 @@ class UploadWorker(QObject):
 
             destination = format_list_path(file.destination_path)
             self._log(
-                f"Supported file: {file.relative_path} -> {destination}"
+                f"Supported file: {file.file_path} -> {destination}"
             )
             self._log_planned_move(file, "completed")
             succeeded += 1
@@ -315,7 +316,7 @@ class UploadWorker(QObject):
             completed_operations += 1
             self.progress.emit(
                 completed_operations,
-                str(file.relative_path),
+                str(file.file_path),
                 processed_files,
             )
 
@@ -336,23 +337,23 @@ class UploadWorker(QObject):
         destination = format_list_path(file.destination_path)
         self._log(
             "Uploading first supported file only for this milestone: "
-            f"{file.relative_path}"
+            f"{file.file_path}"
         )
         self._log(f"Destination list: {destination}")
 
         try:
-            self._log(f"#### Uploading asset: {file.relative_path}")
+            self._log(f"#### Uploading asset: {file.file_path}")
             asset = client.upload_asset(file.file_path)
             asset_id = str(asset["assetId"])
             completed_operations += 1
             self.progress.emit(
                 completed_operations,
-                f"Uploaded asset: {file.relative_path}",
+                f"Uploaded asset: {file.file_path}",
                 processed_files,
             )
             self._log(f"Asset uploaded: {asset_id}", level="SUCCESS")
 
-            self._log(f"Creating asset bookmark: {file.relative_path}")
+            self._log(f"Creating asset bookmark: {file.file_path}")
             bookmark = client.create_asset_bookmark(
                 asset_id=asset_id,
                 file_name=file.file_path.name,
@@ -361,7 +362,7 @@ class UploadWorker(QObject):
             completed_operations += 1
             self.progress.emit(
                 completed_operations,
-                f"Created bookmark: {file.relative_path}",
+                f"Created bookmark: {file.file_path}",
                 processed_files,
             )
             self._log(f"Bookmark created: {bookmark_id}", level="SUCCESS")
@@ -420,7 +421,7 @@ class UploadWorker(QObject):
             processed_files += 1
             self.progress.emit(
                 completed_operations,
-                f"Verified bookmark: {file.relative_path}",
+                f"Verified bookmark: {file.file_path}",
                 processed_files,
             )
             self._log(f"Verification complete: {bookmark_id}", level="SUCCESS")
@@ -431,24 +432,26 @@ class UploadWorker(QObject):
                 completed_operations += 1
                 self.progress.emit(
                     completed_operations,
-                    f"Moved completed file: {file.relative_path}",
+                    f"Moved completed file: {file.file_path}",
                     processed_files,
                 )
         except httpx.HTTPStatusError as exc:
             self._log(
                 "Upload failed: "
-                f"{file.relative_path} ({describe_http_error(exc)})",
+                f"{file.file_path} ({describe_http_error(exc)})",
                 level="ERROR",
                 message_color="ERROR",
             )
+            self.failed_file.emit(str(file.file_path))
             self._try_move_failed_file(file)
             return None
         except Exception as exc:  # noqa: BLE001
             self._log(
-                f"Upload failed: {file.relative_path} ({exc})",
+                f"Upload failed: {file.file_path} ({exc})",
                 level="ERROR",
                 message_color="ERROR",
             )
+            self.failed_file.emit(str(file.file_path))
             self._try_move_failed_file(file)
             return None
 
@@ -465,7 +468,7 @@ class UploadWorker(QObject):
             self._move_processed_file(file, "failed")
         except Exception as exc:  # noqa: BLE001
             self._log(
-                f"Failed file could not be moved: {file.relative_path} ({exc})",
+                f"Failed file could not be moved: {file.file_path} ({exc})",
                 level="ERROR",
                 message_color="ERROR",
             )
@@ -473,16 +476,30 @@ class UploadWorker(QObject):
     def _log_planned_move(self, file, kind: str) -> None:
         root_folder = self._move_folder_for_kind(kind)
         if root_folder is None:
-            self._log(f"Dry-run: would leave {kind} file in place.")
+            self._log(
+                f"Dry-run: would leave {kind} file in place: {file.file_path}"
+            )
             return
 
         destination = self._move_destination_for_file(file, root_folder)
         if destination.exists():
-            if self.config.rename_move_conflicts:
+            if self.config.move_conflict_mode == "rename":
                 destination = self._available_destination_path(destination)
                 self._log(
                     f"Dry-run: would rename conflicting {kind} move to: "
                     f"{destination}"
+                )
+            elif self.config.move_conflict_mode == "overwrite":
+                self._log(
+                    f"Dry-run: would overwrite conflicting {kind} file at: "
+                    f"{destination}",
+                    level="WARNING",
+                )
+            elif self.config.move_conflict_mode == "stop":
+                self._log(
+                    f"Dry-run: would stop because of move conflict: "
+                    f"{destination}",
+                    level="WARNING",
                 )
             else:
                 self._log(
@@ -536,13 +553,16 @@ class UploadWorker(QObject):
         destination_path: Path,
         kind: str,
     ) -> tuple[Path, str] | None:
-        if self.config.rename_move_conflicts:
-            renamed = self._available_destination_path(destination_path)
+        if self.config.move_conflict_mode != "ask":
             self._log(
-                f"Move conflict detected. Renaming {kind} file to: {renamed}",
+                "Move conflict detected. Applying configured policy "
+                f"'{self.config.move_conflict_mode}': {destination_path}",
                 level="WARNING",
             )
-            return renamed, "rename"
+            return self._apply_move_conflict_choice(
+                self.config.move_conflict_mode,
+                destination_path,
+            )
 
         if self._move_conflict_policy is not None:
             return self._apply_move_conflict_choice(

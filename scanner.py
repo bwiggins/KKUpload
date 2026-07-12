@@ -57,13 +57,21 @@ def scan_upload_folder(upload_folder: Path) -> ScanResult:
     )
 
 
-def validate_separate_folder_tree(paths: dict[str, Path]) -> None:
+def validate_separate_folder_tree(
+    paths: dict[str, Path],
+    *,
+    allowed_equal_pairs: set[frozenset[str]] | None = None,
+) -> None:
+    allowed_equal_pairs = allowed_equal_pairs or set()
     resolved = {name: path.resolve() for name, path in paths.items()}
     items = list(resolved.items())
 
     for index, (left_name, left_path) in enumerate(items):
         for right_name, right_path in items[index + 1 :]:
+            pair = frozenset((left_name, right_name))
             if left_path == right_path:
+                if pair in allowed_equal_pairs:
+                    continue
                 raise ValueError(
                     f"{left_name} and {right_name} must be different folders."
                 )

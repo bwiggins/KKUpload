@@ -48,6 +48,23 @@ class ScannerTests(unittest.TestCase):
                     }
                 )
 
+    def test_can_allow_completed_and_error_to_match(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            upload = root / "Upload"
+            output = root / "Output"
+            upload.mkdir()
+            output.mkdir()
+
+            validate_separate_folder_tree(
+                {
+                    "Upload": upload,
+                    "Completed": output,
+                    "Error": output,
+                },
+                allowed_equal_pairs={frozenset(("Completed", "Error"))},
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

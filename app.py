@@ -62,7 +62,7 @@ class UploadConfiguration:
     dont_move_completed: bool
     dont_move_failed: bool
     dont_preserve_move_structure: bool
-    rename_move_conflicts: bool
+    move_conflict_mode: str
     import_to_root: bool
     root_list: str
     default_tags: tuple[str, ...]
@@ -355,7 +355,7 @@ class UploadDialog(QDialog):
         )
 
         self.dont_preserve_move_structure_checkbox = QCheckBox(
-            "Don't preserve folder structure when moving"
+            "Don't preserve subfolders when moving"
         )
         self.dont_preserve_move_structure_checkbox.setChecked(
             self.settings.value(
@@ -365,16 +365,22 @@ class UploadDialog(QDialog):
             )
         )
 
-        self.rename_move_conflicts_checkbox = QCheckBox(
-            "Rename moved files if conflict"
-        )
-        self.rename_move_conflicts_checkbox.setChecked(
-            self.settings.value(
-                "upload/rename_move_conflicts",
-                False,
-                type=bool,
-            )
-        )
+        self.move_conflict_combo = QComboBox()
+        self.move_conflict_combo.addItem("Ask", "ask")
+        self.move_conflict_combo.addItem("Rename", "rename")
+        self.move_conflict_combo.addItem("Overwrite", "overwrite")
+        self.move_conflict_combo.addItem("STOP!", "stop")
+        self._load_move_conflict_mode()
+
+        move_options_layout = QHBoxLayout()
+        move_options_layout.setContentsMargins(0, 0, 0, 0)
+        move_options_layout.addWidget(self.dont_preserve_move_structure_checkbox)
+        move_options_layout.addStretch(1)
+        move_options_layout.addWidget(QLabel("On file move conflict:"))
+        move_options_layout.addWidget(self.move_conflict_combo)
+
+        upload_spacing = QWidget()
+        upload_spacing.setFixedHeight(6)
 
         self.root_list_combo = QComboBox()
         self.root_list_combo.setEditable(True)
@@ -411,13 +417,7 @@ class UploadDialog(QDialog):
         )
 
         self.dry_run_checkbox = QCheckBox("Dry-run")
-        self.dry_run_checkbox.setChecked(
-            self.settings.value(
-                "upload/dry_run",
-                True,
-                type=bool,
-            )
-        )
+        self.dry_run_checkbox.setChecked(True)
 
         default_tags_label = QLabel(
             "Default tags:<br><span style='font-size: 9pt; font-style: italic;'>"
@@ -440,10 +440,10 @@ class UploadDialog(QDialog):
         error_layout.addWidget(self.dont_move_failed_checkbox)
 
         form_layout.addRow("Folder to upload:", self.upload_field)
+        form_layout.addRow("", upload_spacing)
         form_layout.addRow("Completed folder:", completed_layout)
         form_layout.addRow("Error folder:", error_layout)
-        form_layout.addRow("", self.dont_preserve_move_structure_checkbox)
-        form_layout.addRow("", self.rename_move_conflicts_checkbox)
+        form_layout.addRow("", move_options_layout)
 
         root_list_layout = QHBoxLayout()
         root_list_layout.setContentsMargins(0, 0, 0, 0)
@@ -519,7 +519,7 @@ class UploadDialog(QDialog):
         dont_preserve_move_structure = (
             self.dont_preserve_move_structure_checkbox.isChecked()
         )
-        rename_move_conflicts = self.rename_move_conflicts_checkbox.isChecked()
+        move_conflict_mode = str(self.move_conflict_combo.currentData())
 
         if not upload_text:
             self._show_error("Folder to upload cannot be empty.")
@@ -581,7 +581,10 @@ class UploadDialog(QDialog):
             return
 
         try:
-            validate_separate_folder_tree(resolved_paths)
+            validate_separate_folder_tree(
+                resolved_paths,
+                allowed_equal_pairs={frozenset(("Completed", "Error"))},
+            )
         except ValueError as exc:
             self._show_error(str(exc))
             return
@@ -618,7 +621,7 @@ class UploadDialog(QDialog):
             dont_move_completed=dont_move_completed,
             dont_move_failed=dont_move_failed,
             dont_preserve_move_structure=dont_preserve_move_structure,
-            rename_move_conflicts=rename_move_conflicts,
+            move_conflict_mode=move_conflict_mode,
             import_to_root=import_to_root,
             root_list=root_list,
             default_tags=tags,
@@ -650,10 +653,6 @@ class UploadDialog(QDialog):
         )
 
         self.settings.setValue(
-            "upload/dry_run",
-            self.dry_run_checkbox.isChecked(),
-        )
-        self.settings.setValue(
             "upload/dont_move_completed",
             self.dont_move_completed_checkbox.isChecked(),
         )
@@ -666,10 +665,28 @@ class UploadDialog(QDialog):
             self.dont_preserve_move_structure_checkbox.isChecked(),
         )
         self.settings.setValue(
-            "upload/rename_move_conflicts",
-            self.rename_move_conflicts_checkbox.isChecked(),
+            "upload/move_conflict_mode",
+            self.move_conflict_combo.currentData(),
         )
         self.settings.sync()
+
+    def _load_move_conflict_mode(self) -> None:
+        stored_mode = str(
+            self.settings.value("upload/move_conflict_mode", "") or ""
+        )
+        if not stored_mode:
+            stored_mode = (
+                "rename"
+                if self.settings.value(
+                    "upload/rename_move_conflicts",
+                    False,
+                    type=bool,
+                )
+                else "ask"
+            )
+
+        index = self.move_conflict_combo.findData(stored_mode)
+        self.move_conflict_combo.setCurrentIndex(index if index >= 0 else 0)
 
     def _load_text_history(
         self,
@@ -870,6 +887,7 @@ class MainWindow(QMainWindow):
         self.succeeded_count = 0
         self.failed_count = 0
         self.not_processed_count = 0
+        self.failed_files: list[str] = []
         self.completed_operations = 0
         self.total_operations = 0
         self.total_files = 0
@@ -881,7 +899,7 @@ class MainWindow(QMainWindow):
         self.pending_log_entries: deque[tuple[str, str, str | None]] = deque()
         self.pending_finish_stopped: bool | None = None
         self.log_flush_timer = QTimer(self)
-        self.log_flush_timer.setInterval(25)
+        self.log_flush_timer.setInterval(5)
         self.log_flush_timer.timeout.connect(self._flush_pending_logs)
 
         self.setWindowTitle(APP_NAME)
@@ -936,6 +954,13 @@ class MainWindow(QMainWindow):
         self.summary_label = QLabel(
             "Succeeded: 0    Failed: 0    Remaining: 0"
         )
+        self.clear_console_button = QPushButton("Clear Console")
+        self.clear_console_button.clicked.connect(self._clear_console)
+
+        bottom_status_layout = QHBoxLayout()
+        bottom_status_layout.addWidget(self.summary_label)
+        bottom_status_layout.addStretch(1)
+        bottom_status_layout.addWidget(self.clear_console_button)
 
         central_widget = QWidget()
         layout = QVBoxLayout(central_widget)
@@ -943,7 +968,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.console, 1)
         layout.addWidget(self.current_file_label)
         layout.addWidget(self.progress_bar)
-        layout.addWidget(self.summary_label)
+        layout.addLayout(bottom_status_layout)
 
         self.setCentralWidget(central_widget)
 
@@ -1064,6 +1089,7 @@ class MainWindow(QMainWindow):
         self.succeeded_count = 0
         self.failed_count = 0
         self.not_processed_count = 0
+        self.failed_files = []
         self.completed_operations = 0
         self.total_operations = 0
         self.total_files = 0
@@ -1107,10 +1133,17 @@ class MainWindow(QMainWindow):
         else:
             self._log("Move mode: preserve relative folder structure.")
 
-        if config.rename_move_conflicts:
-            self._log("Move conflicts will be renamed automatically.")
-        else:
-            self._log("Move conflicts will ask before continuing.")
+        conflict_labels = {
+            "ask": "ask before continuing",
+            "rename": "rename automatically",
+            "overwrite": "overwrite automatically",
+            "stop": "stop the upload",
+        }
+        self._log(
+            "Move conflict mode: "
+            + conflict_labels.get(config.move_conflict_mode, "ask before continuing")
+            + "."
+        )
 
         if config.import_to_root:
             self._log("Destination mode: import to Karakeep root.")
@@ -1135,7 +1168,7 @@ class MainWindow(QMainWindow):
             dont_move_completed=config.dont_move_completed,
             dont_move_failed=config.dont_move_failed,
             dont_preserve_move_structure=config.dont_preserve_move_structure,
-            rename_move_conflicts=config.rename_move_conflicts,
+            move_conflict_mode=config.move_conflict_mode,
             import_to_root=config.import_to_root,
             root_list=config.root_list,
             default_tags=config.default_tags,
@@ -1151,6 +1184,7 @@ class MainWindow(QMainWindow):
         self.worker.progress_range.connect(self._set_progress_range)
         self.worker.progress.connect(self._set_progress)
         self.worker.move_conflict.connect(self._handle_move_conflict)
+        self.worker.failed_file.connect(self._handle_failed_file)
         self.worker.finished.connect(self._finish_batch)
         self.worker.finished.connect(self.worker_thread.quit)
         self.worker.finished.connect(self.worker.deleteLater)
@@ -1181,6 +1215,9 @@ class MainWindow(QMainWindow):
         self.pending_log_entries.append((message, level, color))
         if not self.log_flush_timer.isActive():
             self.log_flush_timer.start()
+
+    def _handle_failed_file(self, relative_path: str) -> None:
+        self.failed_files.append(relative_path)
 
     def _set_progress_range(self, total_operations: int, total_files: int) -> None:
         self.total_operations = total_operations
@@ -1238,6 +1275,12 @@ class MainWindow(QMainWindow):
             "the next safe checkpoint.",
             level="WARNING",
         )
+
+    def _clear_console(self) -> None:
+        self.pending_log_entries.clear()
+        self.log_flush_timer.stop()
+        self.console.clear()
+        self._write_pending_finish_if_ready()
 
     def _finish_batch(
         self,
@@ -1309,6 +1352,11 @@ class MainWindow(QMainWindow):
                 f"Not processed: {self.not_processed_count} / {total}"
             )
 
+        if self.failed_files:
+            self._log("Failed files:", message_color="ERROR")
+            for failed_file in self.failed_files:
+                self._log(f"- {failed_file}", message_color="ERROR")
+
         self._log_blank_lines(2)
 
     def _log_blank_lines(self, count: int) -> None:
@@ -1325,7 +1373,7 @@ class MainWindow(QMainWindow):
         if flush_all:
             entries_to_flush = len(self.pending_log_entries)
         else:
-            entries_to_flush = min(len(self.pending_log_entries), 50)
+            entries_to_flush = min(len(self.pending_log_entries), 500)
 
         for _ in range(entries_to_flush):
             message, level, color = self.pending_log_entries.popleft()
