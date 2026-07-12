@@ -84,7 +84,7 @@ class KarakeepClient:
     ) -> ListRecord:
         payload: dict[str, Any] = {
             "name": name,
-            "icon": "folder",
+            "icon": "\U0001f4c1",
             "type": "manual",
         }
 
@@ -117,3 +117,11 @@ class KarakeepClient:
             ),
             type=str(item.get("type", "manual")),
         )
+
+
+def describe_http_error(exc: httpx.HTTPStatusError) -> str:
+    response_text = exc.response.text.strip()
+    status = f"HTTP {exc.response.status_code}"
+    if not response_text:
+        return status
+    return f"{status}: {response_text}"

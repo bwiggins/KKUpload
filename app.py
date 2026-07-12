@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -669,6 +670,10 @@ class MainWindow(QMainWindow):
         self.is_running = False
         self.worker_thread: QThread | None = None
         self.worker: UploadWorker | None = None
+        self.pending_log_entries: deque[tuple[str, str, str | None]] = deque()
+        self.log_flush_timer = QTimer(self)
+        self.log_flush_timer.setInterval(25)
+        self.log_flush_timer.timeout.connect(self._flush_pending_logs)
 
         self.setWindowTitle(APP_NAME)
         self.resize(900, 650)
@@ -928,7 +933,9 @@ class MainWindow(QMainWindow):
         message_color: object,
     ) -> None:
         color = message_color if isinstance(message_color, str) else None
-        self._log(message, level=level, message_color=color)
+        self.pending_log_entries.append((message, level, color))
+        if not self.log_flush_timer.isActive():
+            self.log_flush_timer.start()
 
     def _set_progress_range(self, total_files: int) -> None:
         self.total_files = total_files
@@ -990,6 +997,7 @@ class MainWindow(QMainWindow):
         self.succeeded_count = succeeded
         self.failed_count = failed
         self.not_processed_count = not_processed
+        self._flush_pending_logs(flush_all=True)
 
         self._update_connection_state()
         self.is_paused = False
@@ -1020,6 +1028,7 @@ class MainWindow(QMainWindow):
     def _clear_worker_references(self) -> None:
         self.worker = None
         self.worker_thread = None
+        self._flush_pending_logs(flush_all=True)
 
     def _update_summary(self) -> None:
         remaining = max(
@@ -1073,6 +1082,19 @@ class MainWindow(QMainWindow):
 
         scrollbar = self.console.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
+
+    def _flush_pending_logs(self, flush_all: bool = False) -> None:
+        if flush_all:
+            entries_to_flush = len(self.pending_log_entries)
+        else:
+            entries_to_flush = min(len(self.pending_log_entries), 50)
+
+        for _ in range(entries_to_flush):
+            message, level, color = self.pending_log_entries.popleft()
+            self._log(message, level=level, message_color=color)
+
+        if not self.pending_log_entries:
+            self.log_flush_timer.stop()
 
     def _log(
         self,

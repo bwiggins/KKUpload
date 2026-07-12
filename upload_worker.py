@@ -4,9 +4,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+import httpx
 from PySide6.QtCore import QObject, QThread, Signal
 
-from karakeep_client import KarakeepClient
+from karakeep_client import KarakeepClient, describe_http_error
 from list_planner import (
     ListIndex,
     ListRecord,
@@ -93,7 +94,7 @@ class UploadWorker(QObject):
             if not self._resolve_lists(client, list_index, plan.required_lists):
                 failed = 1
                 not_processed = total_files
-                self.finished.emit(False, succeeded, failed, not_processed)
+                self.finished.emit(True, succeeded, failed, not_processed)
                 return
 
             current_folder_parts: tuple[str, ...] | None = None
@@ -115,7 +116,8 @@ class UploadWorker(QObject):
                     current_folder_parts = file.relative_path.parent.parts
                     self._log(
                         "Entering folder: "
-                        + self._format_relative_folder(current_folder_parts)
+                        + self._format_relative_folder(current_folder_parts),
+                        message_color="START",
                     )
 
                 destination = format_list_path(file.destination_path)
@@ -129,7 +131,7 @@ class UploadWorker(QObject):
         except Exception as exc:  # noqa: BLE001
             self._log(f"Batch failed: {exc}", level="ERROR", message_color="ERROR")
             failed += 1
-            self.finished.emit(False, succeeded, failed, not_processed)
+            self.finished.emit(True, succeeded, failed, not_processed)
 
     def _scan(self):
         self._log(f"Scanning upload folder: {self.config.upload_folder}")
@@ -181,6 +183,14 @@ class UploadWorker(QObject):
                     name=required_list.name,
                     parent_id=parent_id,
                 )
+            except httpx.HTTPStatusError as exc:
+                self._log(
+                    "List creation failed: "
+                    f"{path_label} ({describe_http_error(exc)})",
+                    level="ERROR",
+                    message_color="ERROR",
+                )
+                return False
             except Exception as exc:  # noqa: BLE001
                 self._log(
                     f"List creation failed: {path_label} ({exc})",
