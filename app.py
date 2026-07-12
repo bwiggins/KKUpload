@@ -726,6 +726,7 @@ class MainWindow(QMainWindow):
         self.succeeded_count = 0
         self.failed_count = 0
         self.stop_requested = False
+        self.is_paused = False
         self.is_running = False
 
         self.timer = QTimer(self)
@@ -743,6 +744,10 @@ class MainWindow(QMainWindow):
         self.upload_button = QPushButton("Configure Upload")
         self.upload_button.clicked.connect(self._open_upload_dialog)
 
+        self.pause_button = QPushButton("Pause")
+        self.pause_button.setEnabled(False)
+        self.pause_button.clicked.connect(self._toggle_pause)
+
         self.stop_button = QPushButton("Stop")
         self.stop_button.setEnabled(False)
         self.stop_button.clicked.connect(self._request_stop)
@@ -755,6 +760,8 @@ class MainWindow(QMainWindow):
         button_layout = QHBoxLayout()
         button_layout.addWidget(self.connection_settings_button)
         button_layout.addWidget(self.upload_button)
+        button_layout.addSpacing(12)
+        button_layout.addWidget(self.pause_button)
         button_layout.addWidget(self.stop_button)
         button_layout.addStretch(1)
         button_layout.addWidget(self.connection_status_label)
@@ -834,6 +841,7 @@ class MainWindow(QMainWindow):
 
     def _update_connection_state(self) -> None:
         has_settings = self._has_connection_settings()
+        self.connection_settings_button.setEnabled(not self.is_running)
         self.upload_button.setEnabled(has_settings and not self.is_running)
 
         if has_settings:
@@ -841,7 +849,7 @@ class MainWindow(QMainWindow):
                 self.settings.value("connection/server_url", "") or ""
             ).strip()
             self.connection_status_label.setText(server_url)
-            self.connection_status_label.setContentsMargins(0, 0, 36, 0)
+            self.connection_status_label.setContentsMargins(0, 0, 18, 0)
         else:
             self.connection_status_label.setText("Karakeep: Not configured")
             self.connection_status_label.setContentsMargins(0, 0, 0, 0)
@@ -892,9 +900,13 @@ class MainWindow(QMainWindow):
         self.succeeded_count = 0
         self.failed_count = 0
         self.stop_requested = False
+        self.is_paused = False
         self.is_running = True
 
         self.upload_button.setEnabled(False)
+        self.connection_settings_button.setEnabled(False)
+        self.pause_button.setEnabled(True)
+        self.pause_button.setText("Pause")
         self.stop_button.setEnabled(True)
 
         self.progress_bar.setRange(0, self.DUMMY_TOTAL_FILES)
@@ -948,6 +960,9 @@ class MainWindow(QMainWindow):
             self._finish_batch(stopped=True)
             return
 
+        if self.is_paused:
+            return
+
         if self.current_index >= self.DUMMY_TOTAL_FILES:
             self._finish_batch(stopped=False)
             return
@@ -983,11 +998,29 @@ class MainWindow(QMainWindow):
         if self.current_index >= self.DUMMY_TOTAL_FILES:
             self._finish_batch(stopped=False)
 
+    def _toggle_pause(self) -> None:
+        if not self.is_running or self.stop_requested:
+            return
+
+        self.is_paused = not self.is_paused
+
+        if self.is_paused:
+            self.pause_button.setText("Unpause")
+            self.current_file_label.setText("Current file: paused")
+            self._log(
+                "Pause requested. No new files will start until unpaused.",
+                level="WARNING",
+            )
+        else:
+            self.pause_button.setText("Pause")
+            self._log("Upload batch unpaused.")
+
     def _request_stop(self) -> None:
         if not self.is_running:
             return
 
         self.stop_requested = True
+        self.pause_button.setEnabled(False)
         self.stop_button.setEnabled(False)
         self.stop_button.setText("Stopping...")
         self._log(
@@ -1001,6 +1034,9 @@ class MainWindow(QMainWindow):
         self.is_running = False
 
         self._update_connection_state()
+        self.is_paused = False
+        self.pause_button.setEnabled(False)
+        self.pause_button.setText("Pause")
         self.stop_button.setEnabled(False)
         self.stop_button.setText("Stop")
 
@@ -1008,6 +1044,7 @@ class MainWindow(QMainWindow):
             self.current_file_label.setText("Current file: stopped")
             self._log("Upload batch stopped.", level="WARNING")
             self._log("================================", include_level=False)
+            self._log_completion_summary(include_not_processed=True)
         else:
             self.current_file_label.setText("Current file: complete")
             self._log(
@@ -1041,8 +1078,11 @@ class MainWindow(QMainWindow):
                 f"Remaining: {remaining}"
             )
 
-    def _log_completion_summary(self) -> None:
-        total = self.succeeded_count + self.failed_count
+    def _log_completion_summary(
+        self,
+        include_not_processed: bool = False,
+    ) -> None:
+        total = self.DUMMY_TOTAL_FILES
         self._log(f"Successful: {self.succeeded_count} / {total}")
 
         if self.failed_count > 0:
@@ -1052,6 +1092,10 @@ class MainWindow(QMainWindow):
             )
         else:
             self._log(f"Failed: {self.failed_count} / {total}")
+
+        if include_not_processed:
+            not_processed = max(total - self.current_index, 0)
+            self._log(f"Not processed: {not_processed} / {total}")
 
         self._log("================================", include_level=False)
 
