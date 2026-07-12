@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import mimetypes
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -93,6 +95,82 @@ class KarakeepClient:
 
         response = self._request("POST", "/lists", json=payload)
         return self._parse_list(response.json())
+
+    def upload_asset(self, file_path: Path) -> dict[str, Any]:
+        content_type = (
+            mimetypes.guess_type(file_path.name)[0]
+            or "application/octet-stream"
+        )
+        with file_path.open("rb") as file:
+            response = self._request(
+                "POST",
+                "/assets",
+                files={
+                    "file": (
+                        file_path.name,
+                        file,
+                        content_type,
+                    )
+                },
+            )
+        return response.json()
+
+    def create_asset_bookmark(
+        self,
+        *,
+        asset_id: str,
+        file_name: str,
+    ) -> dict[str, Any]:
+        response = self._request(
+            "POST",
+            "/bookmarks",
+            json={
+                "type": "asset",
+                "assetType": "image",
+                "assetId": asset_id,
+                "fileName": file_name,
+                "title": file_name,
+                "source": "api",
+            },
+        )
+        return response.json()
+
+    def add_bookmark_to_list(self, *, list_id: str, bookmark_id: str) -> None:
+        self._request("PUT", f"/lists/{list_id}/bookmarks/{bookmark_id}")
+
+    def attach_tags_to_bookmark(
+        self,
+        *,
+        bookmark_id: str,
+        tag_names: tuple[str, ...],
+    ) -> None:
+        if not tag_names:
+            return
+
+        self._request(
+            "POST",
+            f"/bookmarks/{bookmark_id}/tags",
+            json={
+                "tags": [
+                    {
+                        "tagName": tag_name,
+                        "attachedBy": "human",
+                    }
+                    for tag_name in tag_names
+                ]
+            },
+        )
+
+    def get_bookmark(self, bookmark_id: str) -> dict[str, Any]:
+        response = self._request("GET", f"/bookmarks/{bookmark_id}")
+        return response.json()
+
+    def get_bookmark_lists(self, bookmark_id: str) -> tuple[ListRecord, ...]:
+        response = self._request("GET", f"/bookmarks/{bookmark_id}/lists")
+        data = response.json()
+        if isinstance(data, list):
+            return tuple(self._parse_list(item) for item in data)
+        return tuple(self._parse_list(item) for item in data.get("lists", []))
 
     def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
         response = httpx.request(

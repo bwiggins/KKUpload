@@ -57,8 +57,11 @@ KEYRING_USERNAME: Final[str] = "karakeep_api_key"
 @dataclass(frozen=True)
 class UploadConfiguration:
     upload_folder: Path
-    completed_folder: Path
-    error_folder: Path
+    completed_folder: Path | None
+    error_folder: Path | None
+    dont_move_completed: bool
+    dont_move_failed: bool
+    dont_preserve_move_structure: bool
     import_to_root: bool
     root_list: str
     default_tags: tuple[str, ...]
@@ -326,6 +329,41 @@ class UploadDialog(QDialog):
             "Select Error Folder",
         )
 
+        self.dont_move_completed_checkbox = QCheckBox("Don't move completed")
+        self.dont_move_completed_checkbox.setChecked(
+            self.settings.value(
+                "upload/dont_move_completed",
+                False,
+                type=bool,
+            )
+        )
+        self.dont_move_completed_checkbox.toggled.connect(
+            self._update_move_folder_state
+        )
+
+        self.dont_move_failed_checkbox = QCheckBox("Don't move failed")
+        self.dont_move_failed_checkbox.setChecked(
+            self.settings.value(
+                "upload/dont_move_failed",
+                False,
+                type=bool,
+            )
+        )
+        self.dont_move_failed_checkbox.toggled.connect(
+            self._update_move_folder_state
+        )
+
+        self.dont_preserve_move_structure_checkbox = QCheckBox(
+            "Don't preserve folder structure when moving"
+        )
+        self.dont_preserve_move_structure_checkbox.setChecked(
+            self.settings.value(
+                "upload/dont_preserve_move_structure",
+                False,
+                type=bool,
+            )
+        )
+
         self.root_list_combo = QComboBox()
         self.root_list_combo.setEditable(True)
         self.root_list_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
@@ -379,9 +417,20 @@ class UploadDialog(QDialog):
         form_layout.setFieldGrowthPolicy(
             QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow
         )
+        completed_layout = QHBoxLayout()
+        completed_layout.setContentsMargins(0, 0, 0, 0)
+        completed_layout.addWidget(self.completed_field, 1)
+        completed_layout.addWidget(self.dont_move_completed_checkbox)
+
+        error_layout = QHBoxLayout()
+        error_layout.setContentsMargins(0, 0, 0, 0)
+        error_layout.addWidget(self.error_field, 1)
+        error_layout.addWidget(self.dont_move_failed_checkbox)
+
         form_layout.addRow("Folder to upload:", self.upload_field)
-        form_layout.addRow("Completed folder:", self.completed_field)
-        form_layout.addRow("Error folder:", self.error_field)
+        form_layout.addRow("Completed folder:", completed_layout)
+        form_layout.addRow("Error folder:", error_layout)
+        form_layout.addRow("", self.dont_preserve_move_structure_checkbox)
 
         root_list_layout = QHBoxLayout()
         root_list_layout.setContentsMargins(0, 0, 0, 0)
@@ -427,9 +476,18 @@ class UploadDialog(QDialog):
         self._update_root_list_state(
             self.import_to_root_checkbox.isChecked()
         )
+        self._update_move_folder_state()
 
     def _update_root_list_state(self, import_to_root: bool) -> None:
         self.root_list_combo.setEnabled(not import_to_root)
+
+    def _update_move_folder_state(self) -> None:
+        self.completed_field.setEnabled(
+            not self.dont_move_completed_checkbox.isChecked()
+        )
+        self.error_field.setEnabled(
+            not self.dont_move_failed_checkbox.isChecked()
+        )
 
     def _update_start_button_text(self, dry_run: bool) -> None:
         if dry_run:
@@ -443,22 +501,41 @@ class UploadDialog(QDialog):
         error_text = self.error_field.text()
         root_list = self.root_list_combo.currentText().strip()
         import_to_root = self.import_to_root_checkbox.isChecked()
+        dont_move_completed = self.dont_move_completed_checkbox.isChecked()
+        dont_move_failed = self.dont_move_failed_checkbox.isChecked()
+        dont_preserve_move_structure = (
+            self.dont_preserve_move_structure_checkbox.isChecked()
+        )
 
         if not upload_text:
-            self._show_error("An Upload folder is required.")
+            self._show_error("Folder to upload cannot be empty.")
             return
 
-        if not completed_text:
-            self._show_error("A Completed folder is required.")
+        if not dont_move_completed and not completed_text:
+            self._show_error(
+                "Completed folder cannot be empty unless "
+                "\"Don't move completed\" is checked."
+            )
             return
 
-        if not error_text:
-            self._show_error("An Error folder is required.")
+        if not dont_move_failed and not error_text:
+            self._show_error(
+                "Error folder cannot be empty unless "
+                "\"Don't move failed\" is checked."
+            )
             return
 
         upload_folder = Path(upload_text).expanduser()
-        completed_folder = Path(completed_text).expanduser()
-        error_folder = Path(error_text).expanduser()
+        completed_folder = (
+            None
+            if dont_move_completed
+            else Path(completed_text).expanduser()
+        )
+        error_folder = (
+            None
+            if dont_move_failed
+            else Path(error_text).expanduser()
+        )
 
         if not upload_folder.exists():
             self._show_error(
@@ -480,27 +557,26 @@ class UploadDialog(QDialog):
 
         try:
             resolved_upload = upload_folder.resolve()
-            resolved_completed = completed_folder.resolve()
-            resolved_error = error_folder.resolve()
+            resolved_paths = {"Upload": resolved_upload}
+            if completed_folder is not None:
+                resolved_paths["Completed"] = completed_folder.resolve()
+            if error_folder is not None:
+                resolved_paths["Error"] = error_folder.resolve()
         except OSError as exc:
             self._show_error(f"Unable to resolve folder paths:\n\n{exc}")
             return
 
         try:
-            validate_separate_folder_tree(
-                {
-                    "Upload": resolved_upload,
-                    "Completed": resolved_completed,
-                    "Error": resolved_error,
-                }
-            )
+            validate_separate_folder_tree(resolved_paths)
         except ValueError as exc:
             self._show_error(str(exc))
             return
 
         try:
-            completed_folder.mkdir(parents=True, exist_ok=True)
-            error_folder.mkdir(parents=True, exist_ok=True)
+            if completed_folder is not None:
+                completed_folder.mkdir(parents=True, exist_ok=True)
+            if error_folder is not None:
+                error_folder.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             self._show_error(
                 f"Unable to create a destination folder:\n\n{exc}"
@@ -515,8 +591,19 @@ class UploadDialog(QDialog):
 
         self.configuration = UploadConfiguration(
             upload_folder=upload_folder.resolve(),
-            completed_folder=completed_folder.resolve(),
-            error_folder=error_folder.resolve(),
+            completed_folder=(
+                completed_folder.resolve()
+                if completed_folder is not None
+                else None
+            ),
+            error_folder=(
+                error_folder.resolve()
+                if error_folder is not None
+                else None
+            ),
+            dont_move_completed=dont_move_completed,
+            dont_move_failed=dont_move_failed,
+            dont_preserve_move_structure=dont_preserve_move_structure,
             import_to_root=import_to_root,
             root_list=root_list,
             default_tags=tags,
@@ -528,8 +615,10 @@ class UploadDialog(QDialog):
 
     def _save_values(self) -> None:
         self.upload_field.save_current_value()
-        self.completed_field.save_current_value()
-        self.error_field.save_current_value()
+        if not self.dont_move_completed_checkbox.isChecked():
+            self.completed_field.save_current_value()
+        if not self.dont_move_failed_checkbox.isChecked():
+            self.error_field.save_current_value()
 
         self._save_text_history(
             self.root_list_combo,
@@ -548,6 +637,18 @@ class UploadDialog(QDialog):
         self.settings.setValue(
             "upload/dry_run",
             self.dry_run_checkbox.isChecked(),
+        )
+        self.settings.setValue(
+            "upload/dont_move_completed",
+            self.dont_move_completed_checkbox.isChecked(),
+        )
+        self.settings.setValue(
+            "upload/dont_move_failed",
+            self.dont_move_failed_checkbox.isChecked(),
+        )
+        self.settings.setValue(
+            "upload/dont_preserve_move_structure",
+            self.dont_preserve_move_structure_checkbox.isChecked(),
         )
         self.settings.sync()
 
@@ -664,6 +765,8 @@ class MainWindow(QMainWindow):
         self.succeeded_count = 0
         self.failed_count = 0
         self.not_processed_count = 0
+        self.completed_operations = 0
+        self.total_operations = 0
         self.total_files = 0
         self.stop_requested = False
         self.is_paused = False
@@ -671,6 +774,7 @@ class MainWindow(QMainWindow):
         self.worker_thread: QThread | None = None
         self.worker: UploadWorker | None = None
         self.pending_log_entries: deque[tuple[str, str, str | None]] = deque()
+        self.pending_finish_stopped: bool | None = None
         self.log_flush_timer = QTimer(self)
         self.log_flush_timer.setInterval(25)
         self.log_flush_timer.timeout.connect(self._flush_pending_logs)
@@ -855,6 +959,8 @@ class MainWindow(QMainWindow):
         self.succeeded_count = 0
         self.failed_count = 0
         self.not_processed_count = 0
+        self.completed_operations = 0
+        self.total_operations = 0
         self.total_files = 0
         self.stop_requested = False
         self.is_paused = False
@@ -873,7 +979,9 @@ class MainWindow(QMainWindow):
 
         self._log(f"Found upload folder: {config.upload_folder}")
 
-        if config.completed_folder.exists():
+        if config.dont_move_completed:
+            self._log("Completed files will not be moved.")
+        elif config.completed_folder is not None and config.completed_folder.exists():
             self._log(
                 f"Found completed folder: {config.completed_folder}"
             )
@@ -882,10 +990,17 @@ class MainWindow(QMainWindow):
                 f"Created completed folder: {config.completed_folder}"
             )
 
-        if config.error_folder.exists():
+        if config.dont_move_failed:
+            self._log("Failed files will not be moved.")
+        elif config.error_folder is not None and config.error_folder.exists():
             self._log(f"Found error folder: {config.error_folder}")
         else:
             self._log(f"Created error folder: {config.error_folder}")
+
+        if config.dont_preserve_move_structure:
+            self._log("Move mode: drop files directly into output folders.")
+        else:
+            self._log("Move mode: preserve relative folder structure.")
 
         if config.import_to_root:
             self._log("Destination mode: import to Karakeep root.")
@@ -905,8 +1020,14 @@ class MainWindow(QMainWindow):
             server_url=server_url,
             api_key=api_key,
             upload_folder=config.upload_folder,
+            completed_folder=config.completed_folder,
+            error_folder=config.error_folder,
+            dont_move_completed=config.dont_move_completed,
+            dont_move_failed=config.dont_move_failed,
+            dont_preserve_move_structure=config.dont_preserve_move_structure,
             import_to_root=config.import_to_root,
             root_list=config.root_list,
+            default_tags=config.default_tags,
             dry_run=config.dry_run,
         )
 
@@ -937,17 +1058,25 @@ class MainWindow(QMainWindow):
         if not self.log_flush_timer.isActive():
             self.log_flush_timer.start()
 
-    def _set_progress_range(self, total_files: int) -> None:
+    def _set_progress_range(self, total_operations: int, total_files: int) -> None:
+        self.total_operations = total_operations
         self.total_files = total_files
-        self.progress_bar.setRange(0, total_files)
+        self.progress_bar.setRange(0, total_operations)
         self.progress_bar.setValue(0)
         self._update_summary()
 
-    def _set_progress(self, index: int, current_file: str) -> None:
-        self.current_index = index
-        self.progress_bar.setValue(index)
+    def _set_progress(
+        self,
+        completed_operations: int,
+        current_operation: str,
+        processed_files: int,
+    ) -> None:
+        self.completed_operations = completed_operations
+        self.current_index = processed_files
+        self.succeeded_count = processed_files
+        self.progress_bar.setValue(completed_operations)
         self.current_file_label.setText(
-            f"Current file: {current_file}"
+            f"Current operation: {current_operation}"
         )
         self._update_summary()
 
@@ -997,7 +1126,6 @@ class MainWindow(QMainWindow):
         self.succeeded_count = succeeded
         self.failed_count = failed
         self.not_processed_count = not_processed
-        self._flush_pending_logs(flush_all=True)
 
         self._update_connection_state()
         self.is_paused = False
@@ -1006,33 +1134,19 @@ class MainWindow(QMainWindow):
         self.stop_button.setEnabled(False)
         self.stop_button.setText("Stop")
 
-        if stopped:
-            self.current_file_label.setText("Current file: stopped")
-            self._log(
-                "UPLOAD BATCH STOPPED!",
-                level="WARNING",
-                message_color="WARNING",
-            )
-            self._log_completion_summary(include_not_processed=True)
-        else:
-            self.current_file_label.setText("Current file: complete")
-            self._log(
-                "UPLOAD BATCH COMPLETE!",
-                level="SUCCESS",
-                message_color="SUCCESS",
-            )
-            self._log_completion_summary()
-
+        self.pending_finish_stopped = stopped
+        self.current_file_label.setText("Current file: finalizing log output...")
         self._update_summary()
+        self._write_pending_finish_if_ready()
 
     def _clear_worker_references(self) -> None:
         self.worker = None
         self.worker_thread = None
-        self._flush_pending_logs(flush_all=True)
+        self._write_pending_finish_if_ready()
 
     def _update_summary(self) -> None:
         remaining = max(
-            self.total_files - self.current_index,
+            self.total_files - self.succeeded_count,
             0,
         )
 
@@ -1091,10 +1205,45 @@ class MainWindow(QMainWindow):
 
         for _ in range(entries_to_flush):
             message, level, color = self.pending_log_entries.popleft()
-            self._log(message, level=level, message_color=color)
+            self._log(
+                message,
+                level=level,
+                message_color=color,
+                include_level=bool(level),
+            )
 
         if not self.pending_log_entries:
             self.log_flush_timer.stop()
+            self._write_pending_finish_if_ready()
+
+    def _write_pending_finish_if_ready(self) -> None:
+        if self.pending_log_entries:
+            if not self.log_flush_timer.isActive():
+                self.log_flush_timer.start()
+            return
+
+        if self.pending_finish_stopped is None:
+            return
+
+        stopped = self.pending_finish_stopped
+        self.pending_finish_stopped = None
+
+        if stopped:
+            self.current_file_label.setText("Current file: stopped")
+            self._log(
+                "UPLOAD BATCH STOPPED!",
+                level="WARNING",
+                message_color="WARNING",
+            )
+            self._log_completion_summary(include_not_processed=True)
+        else:
+            self.current_file_label.setText("Current file: complete")
+            self._log(
+                "UPLOAD BATCH COMPLETE!",
+                level="SUCCESS",
+                message_color="SUCCESS",
+            )
+            self._log_completion_summary()
 
     def _log(
         self,
@@ -1133,10 +1282,17 @@ class MainWindow(QMainWindow):
             if include_level:
                 cursor.insertText(f"[{level}] ", level_format)
 
-        cursor.insertText(
-            message,
-            message_format if message_color is not None else default_format,
-        )
+        if message.startswith("#### "):
+            cursor.insertText("#### ", timestamp_format)
+            cursor.insertText(
+                message.removeprefix("#### "),
+                message_format if message_color is not None else default_format,
+            )
+        else:
+            cursor.insertText(
+                message,
+                message_format if message_color is not None else default_format,
+            )
 
         scrollbar = self.console.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
