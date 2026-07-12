@@ -7,9 +7,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Final
 
-import httpx
 import keyring
-from PySide6.QtCore import QSettings, QTimer, Qt
+from PySide6.QtCore import QSettings, QThread, QTimer, Qt
 from PySide6.QtGui import (
     QColor,
     QCloseEvent,
@@ -40,6 +39,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from karakeep_client import KarakeepClient
+from scanner import validate_separate_folder_tree
+from upload_worker import UploadJobConfig, UploadWorker
+
 
 APP_NAME: Final[str] = "KKUpload"
 ORGANIZATION_NAME: Final[str] = "Brad"
@@ -48,18 +51,6 @@ DEFAULT_TAGS: Final[str] = "!!-TAGGING-!!"
 MAX_RECENT_VALUES: Final[int] = 10
 KEYRING_SERVICE: Final[str] = "KKUpload"
 KEYRING_USERNAME: Final[str] = "karakeep_api_key"
-KARAKEEP_API_PREFIX: Final[str] = "/api/v1"
-
-SUPPORTED_EXTENSIONS: Final[set[str]] = {
-    ".jpg",
-    ".jpeg",
-    ".png",
-    ".webp",
-    ".gif",
-    ".bmp",
-    ".tif",
-    ".tiff",
-}
 
 
 @dataclass(frozen=True)
@@ -226,43 +217,11 @@ class ConnectionSettingsDialog(QDialog):
 
     @staticmethod
     def normalized_server_url(server_url: str) -> str:
-        return server_url.strip().rstrip("/")
-
-    @classmethod
-    def api_base_url(cls, server_url: str) -> str:
-        return cls.normalized_server_url(server_url) + KARAKEEP_API_PREFIX
+        return KarakeepClient.normalized_server_url(server_url)
 
     @staticmethod
     def test_connection(server_url: str, api_key: str) -> tuple[bool, str]:
-        normalized_url = ConnectionSettingsDialog.normalized_server_url(server_url)
-        stripped_key = api_key.strip()
-
-        if not normalized_url:
-            return False, "Enter a Karakeep server URL."
-
-        if not (
-            normalized_url.startswith("http://")
-            or normalized_url.startswith("https://")
-        ):
-            return False, "Server URL must start with http:// or https://."
-
-        if not stripped_key:
-            return False, "Enter a Karakeep API key."
-
-        try:
-            response = httpx.get(
-                ConnectionSettingsDialog.api_base_url(normalized_url) + "/lists",
-                headers={"Authorization": f"Bearer {stripped_key}"},
-                timeout=10.0,
-            )
-            response.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            status_code = exc.response.status_code
-            return False, f"Connection failed: HTTP {status_code}."
-        except httpx.RequestError as exc:
-            return False, f"Connection failed: {exc}"
-
-        return True, "Connected to Karakeep."
+        return KarakeepClient(server_url, api_key).test_connection()
 
     def values(self) -> tuple[str, str]:
         return (
@@ -526,28 +485,16 @@ class UploadDialog(QDialog):
             self._show_error(f"Unable to resolve folder paths:\n\n{exc}")
             return
 
-        if len(
-            {
-                resolved_upload,
-                resolved_completed,
-                resolved_error,
-            }
-        ) != 3:
-            self._show_error(
-                "Upload, Completed, and Error must be different folders."
+        try:
+            validate_separate_folder_tree(
+                {
+                    "Upload": resolved_upload,
+                    "Completed": resolved_completed,
+                    "Error": resolved_error,
+                }
             )
-            return
-
-        if self._is_inside(resolved_completed, resolved_upload):
-            self._show_error(
-                "The Completed folder cannot be inside the Upload folder."
-            )
-            return
-
-        if self._is_inside(resolved_error, resolved_upload):
-            self._show_error(
-                "The Error folder cannot be inside the Upload folder."
-            )
+        except ValueError as exc:
+            self._show_error(str(exc))
             return
 
         try:
@@ -651,14 +598,6 @@ class UploadDialog(QDialog):
         if current:
             combo.setCurrentText(current)
 
-    @staticmethod
-    def _is_inside(candidate: Path, parent: Path) -> bool:
-        try:
-            candidate.relative_to(parent)
-            return True
-        except ValueError:
-            return False
-
     def _show_error(self, message: str) -> None:
         QMessageBox.critical(
             self,
@@ -711,8 +650,6 @@ class StatusConsole(QPlainTextEdit):
 class MainWindow(QMainWindow):
     """Main KKUpload application window."""
 
-    DUMMY_TOTAL_FILES: Final[int] = 20
-
     def __init__(self) -> None:
         super().__init__()
 
@@ -725,13 +662,13 @@ class MainWindow(QMainWindow):
         self.current_index = 0
         self.succeeded_count = 0
         self.failed_count = 0
+        self.not_processed_count = 0
+        self.total_files = 0
         self.stop_requested = False
         self.is_paused = False
         self.is_running = False
-
-        self.timer = QTimer(self)
-        self.timer.setInterval(250)
-        self.timer.timeout.connect(self._process_dummy_step)
+        self.worker_thread: QThread | None = None
+        self.worker: UploadWorker | None = None
 
         self.setWindowTitle(APP_NAME)
         self.resize(900, 650)
@@ -871,22 +808,35 @@ class MainWindow(QMainWindow):
             return
 
         self.configuration = dialog.configuration
-        self._start_dummy_upload()
+        self._start_upload_job()
 
-    def _start_dummy_upload(self) -> None:
+    def _start_upload_job(self) -> None:
         config = self.configuration
         if config is None:
             self._log("Upload configuration was not returned.")
             return
 
+        server_url = str(
+            self.settings.value("connection/server_url", "") or ""
+        ).strip()
+
+        try:
+            api_key = (
+                keyring.get_password(KEYRING_SERVICE, KEYRING_USERNAME)
+                or ""
+            )
+        except keyring.errors.KeyringError as exc:
+            self._log(f"Unable to read API key: {exc}", level="ERROR")
+            return
+
         if config.dry_run:
             self._log(
-                "STARTING SIMULATED DRY-RUN.",
+                "STARTING DRY-RUN.",
                 message_color="START",
             )
         else:
             self._log(
-                "STARTING SIMULATED UPLOAD.",
+                "STARTING UPLOAD.",
                 message_color="START",
             )
 
@@ -899,6 +849,8 @@ class MainWindow(QMainWindow):
         self.current_index = 0
         self.succeeded_count = 0
         self.failed_count = 0
+        self.not_processed_count = 0
+        self.total_files = 0
         self.stop_requested = False
         self.is_paused = False
         self.is_running = True
@@ -909,7 +861,7 @@ class MainWindow(QMainWindow):
         self.pause_button.setText("Pause")
         self.stop_button.setEnabled(True)
 
-        self.progress_bar.setRange(0, self.DUMMY_TOTAL_FILES)
+        self.progress_bar.setRange(0, 0)
         self.progress_bar.setValue(0)
         self.current_file_label.setText("Current file: preparing...")
         self._update_summary()
@@ -944,65 +896,61 @@ class MainWindow(QMainWindow):
         else:
             self._log("Default tags: none")
 
-        if config.dry_run:
-            self._log(
-                f"Dry-run will inspect {self.DUMMY_TOTAL_FILES} simulated files."
-            )
-        else:
-            self._log(
-                f"Simulating upload of {self.DUMMY_TOTAL_FILES} files."
-            )
-
-        self.timer.start()
-
-    def _process_dummy_step(self) -> None:
-        if self.stop_requested:
-            self._finish_batch(stopped=True)
-            return
-
-        if self.is_paused:
-            return
-
-        if self.current_index >= self.DUMMY_TOTAL_FILES:
-            self._finish_batch(stopped=False)
-            return
-
-        self.current_index += 1
-        filename = f"sample-image-{self.current_index:03d}.jpg"
-
-        self.current_file_label.setText(
-            f"Current file: {filename}"
-        )
-        self._log(
-            f"Simulated upload: {filename}"
+        job_config = UploadJobConfig(
+            server_url=server_url,
+            api_key=api_key,
+            upload_folder=config.upload_folder,
+            import_to_root=config.import_to_root,
+            root_list=config.root_list,
+            dry_run=config.dry_run,
         )
 
-        # Produce one predictable dummy failure so the failure display
-        # can be reviewed during this first UI milestone.
-        if self.current_index == 7:
-            self.failed_count += 1
-            self._log(
-                f"Simulated failure: {filename}",
-                level="ERROR",
-            )
-        else:
-            self.succeeded_count += 1
-            self._log(
-                f"Simulated success: {filename}",
-                level="SUCCESS",
-            )
+        self.worker_thread = QThread(self)
+        self.worker = UploadWorker(job_config)
+        self.worker.moveToThread(self.worker_thread)
 
-        self.progress_bar.setValue(self.current_index)
+        self.worker_thread.started.connect(self.worker.run)
+        self.worker.log.connect(self._handle_worker_log)
+        self.worker.progress_range.connect(self._set_progress_range)
+        self.worker.progress.connect(self._set_progress)
+        self.worker.finished.connect(self._finish_batch)
+        self.worker.finished.connect(self.worker_thread.quit)
+        self.worker.finished.connect(self.worker.deleteLater)
+        self.worker_thread.finished.connect(self.worker_thread.deleteLater)
+        self.worker_thread.finished.connect(self._clear_worker_references)
+
+        self.worker_thread.start()
+
+    def _handle_worker_log(
+        self,
+        message: str,
+        level: str,
+        message_color: object,
+    ) -> None:
+        color = message_color if isinstance(message_color, str) else None
+        self._log(message, level=level, message_color=color)
+
+    def _set_progress_range(self, total_files: int) -> None:
+        self.total_files = total_files
+        self.progress_bar.setRange(0, total_files)
+        self.progress_bar.setValue(0)
         self._update_summary()
 
-        if self.current_index >= self.DUMMY_TOTAL_FILES:
-            self._finish_batch(stopped=False)
+    def _set_progress(self, index: int, current_file: str) -> None:
+        self.current_index = index
+        self.progress_bar.setValue(index)
+        self.current_file_label.setText(
+            f"Current file: {current_file}"
+        )
+        self._update_summary()
 
     def _toggle_pause(self) -> None:
         if not self.is_running or self.stop_requested:
             return
 
         self.is_paused = not self.is_paused
+        if self.worker is not None:
+            self.worker.set_paused(self.is_paused)
 
         if self.is_paused:
             self.pause_button.setText("Unpause")
@@ -1020,18 +968,28 @@ class MainWindow(QMainWindow):
             return
 
         self.stop_requested = True
+        if self.worker is not None:
+            self.worker.request_stop()
         self.pause_button.setEnabled(False)
         self.stop_button.setEnabled(False)
         self.stop_button.setText("Stopping...")
         self._log(
-            "Stop requested. The simulated batch will stop at "
+            "Stop requested. The batch will stop at "
             "the next safe checkpoint.",
             level="WARNING",
         )
 
-    def _finish_batch(self, stopped: bool) -> None:
-        self.timer.stop()
+    def _finish_batch(
+        self,
+        stopped: bool,
+        succeeded: int,
+        failed: int,
+        not_processed: int,
+    ) -> None:
         self.is_running = False
+        self.succeeded_count = succeeded
+        self.failed_count = failed
+        self.not_processed_count = not_processed
 
         self._update_connection_state()
         self.is_paused = False
@@ -1059,9 +1017,13 @@ class MainWindow(QMainWindow):
 
         self._update_summary()
 
+    def _clear_worker_references(self) -> None:
+        self.worker = None
+        self.worker_thread = None
+
     def _update_summary(self) -> None:
         remaining = max(
-            self.DUMMY_TOTAL_FILES - self.current_index,
+            self.total_files - self.current_index,
             0,
         )
 
@@ -1084,7 +1046,7 @@ class MainWindow(QMainWindow):
         self,
         include_not_processed: bool = False,
     ) -> None:
-        total = self.DUMMY_TOTAL_FILES
+        total = self.total_files
         self._log(f"Successful: {self.succeeded_count} / {total}")
 
         if self.failed_count > 0:
@@ -1096,8 +1058,9 @@ class MainWindow(QMainWindow):
             self._log(f"Failed: {self.failed_count} / {total}")
 
         if include_not_processed:
-            not_processed = max(total - self.current_index, 0)
-            self._log(f"Not processed: {not_processed} / {total}")
+            self._log(
+                f"Not processed: {self.not_processed_count} / {total}"
+            )
 
         self._log_blank_lines(2)
 
@@ -1197,7 +1160,7 @@ class MainWindow(QMainWindow):
                 self,
                 "Upload in Progress",
                 (
-                    "A simulated upload is still running.\n\n"
+                    "An upload job is still running.\n\n"
                     "Stop it and close KKUpload?"
                 ),
                 QMessageBox.StandardButton.Yes
@@ -1209,7 +1172,11 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
 
-            self.timer.stop()
+            if self.worker is not None:
+                self.worker.request_stop()
+            if self.worker_thread is not None:
+                self.worker_thread.quit()
+                self.worker_thread.wait(3000)
             self.is_running = False
 
         self.settings.setValue(
