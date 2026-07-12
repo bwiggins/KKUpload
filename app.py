@@ -42,7 +42,7 @@ from PySide6.QtWidgets import (
 
 from karakeep_client import KarakeepClient
 from scanner import validate_separate_folder_tree
-from upload_worker import UploadJobConfig, UploadWorker
+from upload_worker import MoveConflictRequest, UploadJobConfig, UploadWorker
 
 
 APP_NAME: Final[str] = "KKUpload"
@@ -62,6 +62,7 @@ class UploadConfiguration:
     dont_move_completed: bool
     dont_move_failed: bool
     dont_preserve_move_structure: bool
+    rename_move_conflicts: bool
     import_to_root: bool
     root_list: str
     default_tags: tuple[str, ...]
@@ -364,6 +365,17 @@ class UploadDialog(QDialog):
             )
         )
 
+        self.rename_move_conflicts_checkbox = QCheckBox(
+            "Rename moved files if conflict"
+        )
+        self.rename_move_conflicts_checkbox.setChecked(
+            self.settings.value(
+                "upload/rename_move_conflicts",
+                False,
+                type=bool,
+            )
+        )
+
         self.root_list_combo = QComboBox()
         self.root_list_combo.setEditable(True)
         self.root_list_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
@@ -431,6 +443,7 @@ class UploadDialog(QDialog):
         form_layout.addRow("Completed folder:", completed_layout)
         form_layout.addRow("Error folder:", error_layout)
         form_layout.addRow("", self.dont_preserve_move_structure_checkbox)
+        form_layout.addRow("", self.rename_move_conflicts_checkbox)
 
         root_list_layout = QHBoxLayout()
         root_list_layout.setContentsMargins(0, 0, 0, 0)
@@ -506,6 +519,7 @@ class UploadDialog(QDialog):
         dont_preserve_move_structure = (
             self.dont_preserve_move_structure_checkbox.isChecked()
         )
+        rename_move_conflicts = self.rename_move_conflicts_checkbox.isChecked()
 
         if not upload_text:
             self._show_error("Folder to upload cannot be empty.")
@@ -604,6 +618,7 @@ class UploadDialog(QDialog):
             dont_move_completed=dont_move_completed,
             dont_move_failed=dont_move_failed,
             dont_preserve_move_structure=dont_preserve_move_structure,
+            rename_move_conflicts=rename_move_conflicts,
             import_to_root=import_to_root,
             root_list=root_list,
             default_tags=tags,
@@ -649,6 +664,10 @@ class UploadDialog(QDialog):
         self.settings.setValue(
             "upload/dont_preserve_move_structure",
             self.dont_preserve_move_structure_checkbox.isChecked(),
+        )
+        self.settings.setValue(
+            "upload/rename_move_conflicts",
+            self.rename_move_conflicts_checkbox.isChecked(),
         )
         self.settings.sync()
 
@@ -706,6 +725,92 @@ class UploadDialog(QDialog):
             "Invalid Upload Configuration",
             message,
         )
+
+
+class MoveConflictDialog(QDialog):
+    """Asks how to handle a destination-file conflict during a move."""
+
+    def __init__(
+        self,
+        request: MoveConflictRequest,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+
+        self.choice = "stop"
+        self.setWindowTitle("Move Conflict")
+        self.setModal(True)
+        self.setMinimumWidth(700)
+
+        message = QLabel(
+            "A file already exists where KKUpload wants to move this file."
+        )
+        message.setWordWrap(True)
+
+        source_label = QLabel(
+            "<b>Moving file:</b><br>"
+            f"{request.source_path.name}<br>"
+            f"<b>From:</b> {request.source_path.parent}"
+        )
+        source_label.setTextFormat(Qt.TextFormat.RichText)
+        source_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        source_label.setWordWrap(True)
+
+        existing_label = QLabel(
+            "<b>Existing file:</b><br>"
+            f"{request.existing_path.name}<br>"
+            f"<b>In:</b> {request.existing_path.parent}"
+        )
+        existing_label.setTextFormat(Qt.TextFormat.RichText)
+        existing_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        existing_label.setWordWrap(True)
+
+        destination_label = QLabel(
+            f"<b>Requested destination:</b> {request.destination_path}"
+        )
+        destination_label.setTextFormat(Qt.TextFormat.RichText)
+        destination_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        destination_label.setWordWrap(True)
+
+        self.apply_to_all_checkbox = QCheckBox(
+            "Do this operation for all future conflicts"
+        )
+
+        overwrite_button = QPushButton("Overwrite")
+        rename_button = QPushButton("Rename")
+        stop_button = QPushButton("Stop Upload")
+
+        overwrite_button.clicked.connect(lambda: self._choose("overwrite"))
+        rename_button.clicked.connect(lambda: self._choose("rename"))
+        stop_button.clicked.connect(lambda: self._choose("stop"))
+
+        button_layout = QHBoxLayout()
+        button_layout.addStretch(1)
+        button_layout.addWidget(overwrite_button)
+        button_layout.addWidget(rename_button)
+        button_layout.addWidget(stop_button)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(message)
+        layout.addSpacing(8)
+        layout.addWidget(source_label)
+        layout.addSpacing(8)
+        layout.addWidget(existing_label)
+        layout.addSpacing(8)
+        layout.addWidget(destination_label)
+        layout.addSpacing(8)
+        layout.addWidget(self.apply_to_all_checkbox)
+        layout.addLayout(button_layout)
+
+    def _choose(self, choice: str) -> None:
+        self.choice = choice
+        self.accept()
 
 
 class StatusConsole(QPlainTextEdit):
@@ -1002,6 +1107,11 @@ class MainWindow(QMainWindow):
         else:
             self._log("Move mode: preserve relative folder structure.")
 
+        if config.rename_move_conflicts:
+            self._log("Move conflicts will be renamed automatically.")
+        else:
+            self._log("Move conflicts will ask before continuing.")
+
         if config.import_to_root:
             self._log("Destination mode: import to Karakeep root.")
         else:
@@ -1025,6 +1135,7 @@ class MainWindow(QMainWindow):
             dont_move_completed=config.dont_move_completed,
             dont_move_failed=config.dont_move_failed,
             dont_preserve_move_structure=config.dont_preserve_move_structure,
+            rename_move_conflicts=config.rename_move_conflicts,
             import_to_root=config.import_to_root,
             root_list=config.root_list,
             default_tags=config.default_tags,
@@ -1039,6 +1150,7 @@ class MainWindow(QMainWindow):
         self.worker.log.connect(self._handle_worker_log)
         self.worker.progress_range.connect(self._set_progress_range)
         self.worker.progress.connect(self._set_progress)
+        self.worker.move_conflict.connect(self._handle_move_conflict)
         self.worker.finished.connect(self._finish_batch)
         self.worker.finished.connect(self.worker_thread.quit)
         self.worker.finished.connect(self.worker.deleteLater)
@@ -1046,6 +1158,18 @@ class MainWindow(QMainWindow):
         self.worker_thread.finished.connect(self._clear_worker_references)
 
         self.worker_thread.start()
+
+    def _handle_move_conflict(self, request: MoveConflictRequest) -> None:
+        dialog = MoveConflictDialog(request, self)
+        result = dialog.exec()
+
+        if result == QDialog.DialogCode.Accepted:
+            request.resolve(
+                dialog.choice,
+                dialog.apply_to_all_checkbox.isChecked(),
+            )
+        else:
+            request.resolve("stop", False)
 
     def _handle_worker_log(
         self,

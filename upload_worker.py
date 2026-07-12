@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import shutil
+import threading
 from typing import Protocol
 
 import httpx
@@ -29,10 +30,29 @@ class UploadJobConfig:
     dont_move_completed: bool
     dont_move_failed: bool
     dont_preserve_move_structure: bool
+    rename_move_conflicts: bool
     import_to_root: bool
     root_list: str
     default_tags: tuple[str, ...]
     dry_run: bool
+
+
+@dataclass
+class MoveConflictRequest:
+    source_path: Path
+    existing_path: Path
+    destination_path: Path
+    kind: str
+    choice: str | None = None
+    apply_to_all: bool = False
+
+    def __post_init__(self) -> None:
+        self.resolved = threading.Event()
+
+    def resolve(self, choice: str, apply_to_all: bool) -> None:
+        self.choice = choice
+        self.apply_to_all = apply_to_all
+        self.resolved.set()
 
 
 class ClientProtocol(Protocol):
@@ -80,6 +100,7 @@ class UploadWorker(QObject):
     log = Signal(str, str, object)
     progress_range = Signal(int, int)
     progress = Signal(int, str, int)
+    move_conflict = Signal(object)
     finished = Signal(bool, int, int, int)
 
     def __init__(
@@ -93,6 +114,7 @@ class UploadWorker(QObject):
         self._client = client
         self._stop_requested = False
         self._paused = False
+        self._move_conflict_policy: str | None = None
 
     def request_stop(self) -> None:
         self._stop_requested = True
@@ -403,6 +425,8 @@ class UploadWorker(QObject):
             )
             self._log(f"Verification complete: {bookmark_id}", level="SUCCESS")
             move_destination = self._move_processed_file(file, "completed")
+            if self._stop_requested:
+                return None
             if move_destination is not None:
                 completed_operations += 1
                 self.progress.emit(
@@ -453,9 +477,23 @@ class UploadWorker(QObject):
             return
 
         destination = self._move_destination_for_file(file, root_folder)
-        self._log(
-            f"Dry-run: would move {kind} file to: {destination}"
-        )
+        if destination.exists():
+            if self.config.rename_move_conflicts:
+                destination = self._available_destination_path(destination)
+                self._log(
+                    f"Dry-run: would rename conflicting {kind} move to: "
+                    f"{destination}"
+                )
+            else:
+                self._log(
+                    f"Dry-run: would ask how to handle move conflict: "
+                    f"{destination}",
+                    level="WARNING",
+                )
+        else:
+            self._log(
+                f"Dry-run: would move {kind} file to: {destination}"
+            )
 
     def _move_processed_file(self, file, kind: str) -> Path | None:
         root_folder = self._move_folder_for_kind(kind)
@@ -465,12 +503,96 @@ class UploadWorker(QObject):
 
         destination = self._move_destination_for_file(file, root_folder)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        destination = self._available_destination_path(destination)
+        move_choice = "move"
+        if destination.exists():
+            conflict_result = self._resolve_move_conflict(
+                source_path=file.file_path,
+                destination_path=destination,
+                kind=kind,
+            )
+            if conflict_result is None:
+                self._stop_requested = True
+                self._log(
+                    "Upload stopped because a move conflict was not resolved.",
+                    level="WARNING",
+                )
+                return None
 
-        self._log(f"Moving {kind} file to: {destination}")
+            destination, move_choice = conflict_result
+
+        if move_choice == "overwrite":
+            self._log(f"Overwriting {kind} file at: {destination}")
+            destination.unlink()
+        else:
+            self._log(f"Moving {kind} file to: {destination}")
         shutil.move(str(file.file_path), str(destination))
         self._log(f"Moved {kind} file to: {destination}", level="SUCCESS")
         return destination
+
+    def _resolve_move_conflict(
+        self,
+        *,
+        source_path: Path,
+        destination_path: Path,
+        kind: str,
+    ) -> tuple[Path, str] | None:
+        if self.config.rename_move_conflicts:
+            renamed = self._available_destination_path(destination_path)
+            self._log(
+                f"Move conflict detected. Renaming {kind} file to: {renamed}",
+                level="WARNING",
+            )
+            return renamed, "rename"
+
+        if self._move_conflict_policy is not None:
+            return self._apply_move_conflict_choice(
+                self._move_conflict_policy,
+                destination_path,
+            )
+
+        request = MoveConflictRequest(
+            source_path=source_path,
+            existing_path=destination_path,
+            destination_path=destination_path,
+            kind=kind,
+        )
+        self._log(
+            f"Move conflict detected: {destination_path}",
+            level="WARNING",
+        )
+        self.move_conflict.emit(request)
+
+        while not request.resolved.wait(0.1):
+            if self._stop_requested:
+                return None
+
+        if request.choice is None:
+            return None
+
+        if request.apply_to_all and request.choice in {"overwrite", "rename"}:
+            self._move_conflict_policy = request.choice
+
+        return self._apply_move_conflict_choice(
+            request.choice,
+            destination_path,
+        )
+
+    def _apply_move_conflict_choice(
+        self,
+        choice: str,
+        destination_path: Path,
+    ) -> tuple[Path, str] | None:
+        if choice == "overwrite":
+            return destination_path, "overwrite"
+
+        if choice == "rename":
+            renamed = self._available_destination_path(destination_path)
+            return renamed, "rename"
+
+        if choice == "stop":
+            return None
+
+        raise ValueError(f"Unknown conflict choice: {choice}")
 
     def _move_folder_for_kind(self, kind: str) -> Path | None:
         if kind == "completed":
