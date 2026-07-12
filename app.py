@@ -1042,8 +1042,11 @@ class MainWindow(QMainWindow):
 
         if stopped:
             self.current_file_label.setText("Current file: stopped")
-            self._log("Upload batch stopped.", level="WARNING")
-            self._log("================================", include_level=False)
+            self._log(
+                "UPLOAD BATCH STOPPED!",
+                level="WARNING",
+                message_color="WARNING",
+            )
             self._log_completion_summary(include_not_processed=True)
         else:
             self.current_file_label.setText("Current file: complete")
@@ -1052,7 +1055,6 @@ class MainWindow(QMainWindow):
                 level="SUCCESS",
                 message_color="SUCCESS",
             )
-            self._log("================================", include_level=False)
             self._log_completion_summary()
 
         self._update_summary()
@@ -1097,7 +1099,17 @@ class MainWindow(QMainWindow):
             not_processed = max(total - self.current_index, 0)
             self._log(f"Not processed: {not_processed} / {total}")
 
-        self._log("================================", include_level=False)
+        self._log_blank_lines(2)
+
+    def _log_blank_lines(self, count: int) -> None:
+        cursor = self.console.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+
+        for _ in range(count):
+            cursor.insertBlock()
+
+        scrollbar = self.console.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
 
     def _log(
         self,
