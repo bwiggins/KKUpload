@@ -21,7 +21,7 @@ class PreferencesTests(unittest.TestCase):
                 result.preferences.image_resize.maximum_allowed_image_size_mb,
                 49.0,
             )
-            self.assertIn("Created preferences file", result.messages[0][0])
+            self.assertIn("Created defaults and loaded successfully", result.messages[0][0])
 
     def test_invalid_preferences_are_rewritten_with_valid_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -48,7 +48,11 @@ class PreferencesTests(unittest.TestCase):
                 result.preferences.image_resize.maximum_allowed_image_size_mb,
                 49.0,
             )
-            self.assertEqual(rewritten["image_resize"]["maximum_attempts"], 3)
+            self.assertEqual(rewritten["image_resize"]["maximum_attempts"], 4)
+            self.assertIs(
+                rewritten["image_resize"]["fail_if_not_within_goal"],
+                False,
+            )
             self.assertTrue(
                 any(
                     "Rewrote preferences file" in message

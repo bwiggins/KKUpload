@@ -14,8 +14,9 @@ BYTES_PER_MB = 1024 * 1024
 class ImageResizePreferences:
     maximum_allowed_image_size_mb: float = 49.0
     desired_resize_goal_mb: float = 25.0
-    maximum_attempts: int = 3
+    maximum_attempts: int = 4
     acceptable_distance_percent: float = 10.0
+    fail_if_not_within_goal: bool = False
 
     @property
     def maximum_allowed_bytes(self) -> int:
@@ -60,11 +61,10 @@ def load_preferences(app_path: Path) -> PreferenceLoadResult:
         _write_preferences(path, defaults)
         messages.append(
             (
-                f"Created preferences file with defaults: {path}",
+                f"Preferences JSON missing. Created defaults and loaded successfully: {path}",
                 "INFO",
             )
         )
-        messages.append((_format_preferences(defaults), "INFO"))
         return PreferenceLoadResult(defaults, tuple(messages))
 
     try:
@@ -74,11 +74,10 @@ def load_preferences(app_path: Path) -> PreferenceLoadResult:
         messages.append(
             (
                 "Preferences file could not be read. "
-                f"Rewrote defaults: {path} ({exc})",
+                f"Rewrote defaults and loaded successfully: {path} ({exc})",
                 "WARNING",
             )
         )
-        messages.append((_format_preferences(defaults), "INFO"))
         return PreferenceLoadResult(defaults, tuple(messages))
 
     if not isinstance(raw, dict):
@@ -123,7 +122,7 @@ def load_preferences(app_path: Path) -> PreferenceLoadResult:
             )
         )
 
-    messages.append((_format_preferences(preferences), "INFO"))
+    messages.append((f"Preferences JSON loaded successfully: {path}", "INFO"))
     return PreferenceLoadResult(preferences, tuple(messages))
 
 
@@ -157,6 +156,12 @@ def _load_image_resize_preferences(
         defaults.acceptable_distance_percent,
         messages,
     )
+    fail_if_not_within_goal = _bool_value(
+        raw,
+        "fail_if_not_within_goal",
+        defaults.fail_if_not_within_goal,
+        messages,
+    )
 
     if desired_goal >= maximum_allowed:
         messages.append(
@@ -184,6 +189,7 @@ def _load_image_resize_preferences(
             desired_resize_goal_mb=desired_goal,
             maximum_attempts=maximum_attempts,
             acceptable_distance_percent=acceptable_distance,
+            fail_if_not_within_goal=fail_if_not_within_goal,
         ),
         messages,
     )
@@ -239,6 +245,26 @@ def _positive_int(
     return number
 
 
+def _bool_value(
+    raw: dict[str, Any],
+    key: str,
+    default: bool,
+    messages: list[tuple[str, str]],
+) -> bool:
+    value = raw.get(key, default)
+
+    if isinstance(value, bool):
+        return value
+
+    messages.append(
+        (
+            f"Preference {key} was invalid. Using default {default}.",
+            "WARNING",
+        )
+    )
+    return default
+
+
 def _write_preferences(path: Path, preferences: AppPreferences) -> None:
     path.write_text(
         json.dumps(_preferences_to_json(preferences), indent=2) + "\n",
@@ -258,16 +284,6 @@ def _preferences_to_json(preferences: AppPreferences) -> dict[str, Any]:
             "acceptable_distance_percent": (
                 image_resize.acceptable_distance_percent
             ),
+            "fail_if_not_within_goal": image_resize.fail_if_not_within_goal,
         }
     }
-
-
-def _format_preferences(preferences: AppPreferences) -> str:
-    image_resize = preferences.image_resize
-    return (
-        "Image resize preferences: "
-        f"max allowed {image_resize.maximum_allowed_image_size_mb:g} MB; "
-        f"goal {image_resize.desired_resize_goal_mb:g} MB; "
-        f"attempts {image_resize.maximum_attempts}; "
-        f"acceptable distance {image_resize.acceptable_distance_percent:g}%."
-    )

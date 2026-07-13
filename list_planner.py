@@ -75,6 +75,8 @@ def build_upload_plan(
     *,
     import_to_root: bool,
     root_list: str,
+    top_folder_name: str | None = None,
+    omit_top_folder_list: bool = False,
 ) -> UploadPlan:
     required_paths: set[tuple[str, ...]] = set()
     planned_files: list[PlannedFile] = []
@@ -85,8 +87,14 @@ def build_upload_plan(
     else:
         root_path = ()
 
+    top_folder_path = (
+        ()
+        if omit_top_folder_list or not top_folder_name
+        else (top_folder_name,)
+    )
+
     for file in files:
-        destination_path = root_path + file.folder_parts
+        destination_path = root_path + top_folder_path + file.folder_parts
 
         if destination_path:
             for depth in range(1, len(destination_path) + 1):

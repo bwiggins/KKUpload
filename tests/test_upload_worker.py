@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import httpx
 from list_planner import ListRecord
 from preferences import ImageResizePreferences
 from PySide6.QtGui import QImage
@@ -124,6 +125,43 @@ class FailingUploadClient(SuccessfulUploadClient):
         raise RuntimeError("upload failed")
 
 
+class TooLargeOnceUploadClient(SuccessfulUploadClient):
+    def upload_asset(self, file_path: Path) -> dict:
+        self.uploaded_files.append(file_path)
+        self.uploaded_file_sizes.append(file_path.stat().st_size)
+
+        if len(self.uploaded_files) == 1:
+            request = httpx.Request("POST", "https://karakeep.example.test")
+            response = httpx.Response(
+                413,
+                json={"error": "Asset is too big"},
+                request=request,
+            )
+            raise httpx.HTTPStatusError(
+                "Asset is too big",
+                request=request,
+                response=response,
+            )
+
+        self.asset_counter += 1
+        return {"assetId": f"asset-{self.asset_counter}"}
+
+
+class UnsupportedAssetTypeClient(SuccessfulUploadClient):
+    def upload_asset(self, file_path: Path) -> dict:
+        request = httpx.Request("POST", "https://karakeep.example.test")
+        response = httpx.Response(
+            400,
+            json={"error": "Unsupported asset type"},
+            request=request,
+        )
+        raise httpx.HTTPStatusError(
+            "Unsupported asset type",
+            request=request,
+            response=response,
+        )
+
+
 class UploadWorkerTests(unittest.TestCase):
     def test_list_creation_failure_finishes_as_stopped(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -205,8 +243,8 @@ class UploadWorkerTests(unittest.TestCase):
 
             worker.run()
 
-            self.assertEqual(ranges, [(6, 2)])
-            self.assertEqual(progress_values[-1][0], 6)
+            self.assertEqual(ranges, [(7, 2)])
+            self.assertEqual(progress_values[-1][0], 7)
             self.assertEqual(progress_values[-1][2], 2)
 
     def test_dry_run_counts_move_conflicts_as_resolved(self) -> None:
@@ -286,7 +324,13 @@ class UploadWorkerTests(unittest.TestCase):
             worker.run()
 
             self.assertEqual(finished_values, [(False, 2, 0, 0)])
-            self.assertEqual(client.created_lists, [("IMPORT SORTING", None)])
+            self.assertEqual(
+                client.created_lists,
+                [
+                    ("IMPORT SORTING", None),
+                    (upload_folder.name, "list-1"),
+                ],
+            )
             self.assertEqual(
                 client.uploaded_files,
                 [
@@ -304,8 +348,8 @@ class UploadWorkerTests(unittest.TestCase):
             self.assertEqual(
                 client.assigned_lists,
                 [
-                    ("list-1", "bookmark-1"),
-                    ("list-1", "bookmark-2"),
+                    ("list-2", "bookmark-1"),
+                    ("list-2", "bookmark-2"),
                 ],
             )
             self.assertEqual(
@@ -319,6 +363,39 @@ class UploadWorkerTests(unittest.TestCase):
             self.assertTrue((completed_folder / "alpha.jpg").exists())
             self.assertFalse((upload_folder / "beta.jpg").exists())
             self.assertTrue((completed_folder / "beta.jpg").exists())
+
+    def test_worker_can_omit_top_folder_list(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            upload_folder = root / "upload"
+            upload_folder.mkdir()
+            (upload_folder / "alpha.jpg").write_text("x")
+
+            client = SuccessfulUploadClient()
+            worker = UploadWorker(
+                UploadJobConfig(
+                    server_url="https://karakeep.example.test",
+                    api_key="token",
+                    upload_folder=upload_folder,
+                    completed_folder=root / "completed",
+                    error_folder=root / "errors",
+                    dont_move_completed=False,
+                    dont_move_failed=False,
+                    dont_preserve_move_structure=False,
+                    move_conflict_mode="ask",
+                    import_to_root=False,
+                    root_list="IMPORT SORTING",
+                    default_tags=(),
+                    dry_run=False,
+                    omit_top_folder_list=True,
+                ),
+                client=client,
+            )
+
+            worker.run()
+
+            self.assertEqual(client.created_lists, [("IMPORT SORTING", None)])
+            self.assertEqual(client.assigned_lists, [("list-1", "bookmark-1")])
 
     def test_live_upload_resizes_oversized_image_copy(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -365,6 +442,57 @@ class UploadWorkerTests(unittest.TestCase):
             self.assertLess(
                 client.uploaded_file_sizes[0],
                 (completed_folder / "large.bmp").stat().st_size,
+            )
+            self.assertFalse(image_path.exists())
+            self.assertTrue((completed_folder / "large.bmp").exists())
+
+    def test_live_upload_retries_with_resize_after_too_large_response(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            upload_folder = root / "upload"
+            completed_folder = root / "completed"
+            upload_folder.mkdir()
+            image_path = upload_folder / "large.bmp"
+
+            image = QImage(300, 300, QImage.Format.Format_RGB32)
+            image.fill(0xFF663399)
+            self.assertTrue(image.save(str(image_path)))
+
+            client = TooLargeOnceUploadClient()
+            worker = UploadWorker(
+                UploadJobConfig(
+                    server_url="https://karakeep.example.test",
+                    api_key="token",
+                    upload_folder=upload_folder,
+                    completed_folder=completed_folder,
+                    error_folder=root / "errors",
+                    dont_move_completed=False,
+                    dont_move_failed=False,
+                    dont_preserve_move_structure=False,
+                    move_conflict_mode="ask",
+                    import_to_root=False,
+                    root_list="IMPORT SORTING",
+                    default_tags=(),
+                    dry_run=False,
+                    image_resize_preferences=ImageResizePreferences(
+                        maximum_allowed_image_size_mb=10,
+                        desired_resize_goal_mb=0.05,
+                        maximum_attempts=4,
+                        acceptable_distance_percent=25,
+                    ),
+                    resize_images_if_needed=True,
+                ),
+                client=client,
+            )
+
+            worker.run()
+
+            self.assertEqual(len(client.uploaded_files), 2)
+            self.assertEqual(client.uploaded_files[0], image_path.resolve())
+            self.assertNotEqual(client.uploaded_files[1], image_path.resolve())
+            self.assertLess(
+                client.uploaded_file_sizes[1],
+                client.uploaded_file_sizes[0],
             )
             self.assertFalse(image_path.exists())
             self.assertTrue((completed_folder / "large.bmp").exists())
@@ -596,6 +724,66 @@ class UploadWorkerTests(unittest.TestCase):
             self.assertTrue(
                 (error_folder / "fart" / "burp" / "poop.jpg").exists()
             )
+
+    def test_unsupported_asset_type_investigates_failed_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            upload_folder = root / "upload"
+            error_folder = root / "errors"
+            upload_folder.mkdir()
+            html_file = upload_folder / "fake.jpg"
+            html_file.write_text(
+                """
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <meta property="og:image" content="https://example.test/fake.jpg">
+                </head>
+                <body>not really an image</body>
+                </html>
+                """,
+                encoding="utf-8",
+            )
+
+            worker = UploadWorker(
+                UploadJobConfig(
+                    server_url="https://karakeep.example.test",
+                    api_key="token",
+                    upload_folder=upload_folder,
+                    completed_folder=root / "completed",
+                    error_folder=error_folder,
+                    dont_move_completed=False,
+                    dont_move_failed=False,
+                    dont_preserve_move_structure=False,
+                    move_conflict_mode="ask",
+                    import_to_root=False,
+                    root_list="IMPORT SORTING",
+                    default_tags=(),
+                    dry_run=False,
+                ),
+                client=UnsupportedAssetTypeClient(),
+            )
+
+            log_messages: list[str] = []
+            worker.log.connect(
+                lambda message, level, message_color: log_messages.append(message)
+            )
+
+            worker.run()
+
+            joined_logs = "\n".join(log_messages)
+            self.assertIn("Investigating failed file:", joined_logs)
+            self.assertIn("Detected failed file content: HTML document.", joined_logs)
+            self.assertIn(
+                "File extension looks like media, but the file content appears "
+                "to be HTML.",
+                joined_logs,
+            )
+            self.assertIn(
+                "Possible image URL found: https://example.test/fake.jpg",
+                joined_logs,
+            )
+            self.assertTrue((error_folder / "fake.jpg").exists())
 
 
 if __name__ == "__main__":

@@ -48,7 +48,7 @@ from upload_worker import MoveConflictRequest, UploadJobConfig, UploadWorker
 
 APP_NAME: Final[str] = "KKUpload"
 ORGANIZATION_NAME: Final[str] = "Brad"
-DEFAULT_ROOT_LIST: Final[str] = "IMPORT SORTING"
+DEFAULT_ROOT_LIST: Final[str] = "$ KKUpload"
 DEFAULT_TAGS: Final[str] = "!!-TAGGING-!!"
 MAX_RECENT_VALUES: Final[int] = 10
 KEYRING_SERVICE: Final[str] = "KKUpload"
@@ -64,6 +64,10 @@ class UploadConfiguration:
     dont_move_failed: bool
     dont_preserve_move_structure: bool
     move_conflict_mode: str
+    resize_images_if_needed: bool
+    auto_generate_output_folders: bool
+    no_import_tags: bool
+    omit_top_folder_list: bool
     import_to_root: bool
     root_list: str
     default_tags: tuple[str, ...]
@@ -310,6 +314,8 @@ class UploadDialog(QDialog):
 
         self.settings = settings
         self.configuration: UploadConfiguration | None = None
+        self._manual_completed_folder = ""
+        self._manual_error_folder = ""
 
         self.setWindowTitle("Upload Configuration")
         self.setModal(True)
@@ -329,6 +335,48 @@ class UploadDialog(QDialog):
             settings,
             "history/error_folders",
             "Select Error Folder",
+        )
+        self._manual_completed_folder = self.completed_field.text()
+        self._manual_error_folder = self.error_field.text()
+
+        self.resize_images_if_needed_checkbox = QCheckBox(
+            "Allow image resizing"
+        )
+        self.resize_images_if_needed_checkbox.setChecked(
+            self.settings.value(
+                "upload/resize_images_if_needed",
+                True,
+                type=bool,
+            )
+        )
+
+        self.auto_generate_output_folders_checkbox = QCheckBox(
+            "Auto output folders"
+        )
+        self.auto_generate_output_folders_checkbox.setChecked(
+            self.settings.value(
+                "upload/auto_generate_output_folders",
+                False,
+                type=bool,
+            )
+        )
+        self.auto_generate_output_folders_checkbox.toggled.connect(
+            self._handle_auto_generate_output_folders_toggled
+        )
+        self.upload_field.combo.currentTextChanged.connect(
+            self._update_generated_output_folders
+        )
+        self.upload_field.combo.editTextChanged.connect(
+            self._update_generated_output_folders
+        )
+
+        self.omit_top_folder_list_checkbox = QCheckBox("Omit top folder list")
+        self.omit_top_folder_list_checkbox.setChecked(
+            self.settings.value(
+                "upload/omit_top_folder_list",
+                False,
+                type=bool,
+            )
         )
 
         self.dont_move_completed_checkbox = QCheckBox("Don't move completed")
@@ -404,6 +452,18 @@ class UploadDialog(QDialog):
             self._update_root_list_state
         )
 
+        self.no_import_tags_checkbox = QCheckBox("No import tags")
+        self.no_import_tags_checkbox.setChecked(
+            self.settings.value(
+                "upload/no_import_tags",
+                False,
+                type=bool,
+            )
+        )
+        self.no_import_tags_checkbox.toggled.connect(
+            self._update_tags_state
+        )
+
         self.tags_combo = QComboBox()
         self.tags_combo.setEditable(True)
         self.tags_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
@@ -440,7 +500,15 @@ class UploadDialog(QDialog):
         error_layout.addWidget(self.error_field, 1)
         error_layout.addWidget(self.dont_move_failed_checkbox)
 
+        upload_options_layout = QHBoxLayout()
+        upload_options_layout.setContentsMargins(0, 0, 0, 0)
+        upload_options_layout.addWidget(self.resize_images_if_needed_checkbox)
+        upload_options_layout.addWidget(self.auto_generate_output_folders_checkbox)
+        upload_options_layout.addWidget(self.omit_top_folder_list_checkbox)
+        upload_options_layout.addStretch(1)
+
         form_layout.addRow("Folder to upload:", self.upload_field)
+        form_layout.addRow("", upload_options_layout)
         form_layout.addRow("", upload_spacing)
         form_layout.addRow("Completed folder:", completed_layout)
         form_layout.addRow("Error folder:", error_layout)
@@ -451,11 +519,16 @@ class UploadDialog(QDialog):
         root_list_layout.addWidget(self.root_list_combo, 1)
         root_list_layout.addWidget(self.import_to_root_checkbox)
 
+        tags_layout = QHBoxLayout()
+        tags_layout.setContentsMargins(0, 0, 0, 0)
+        tags_layout.addWidget(self.tags_combo, 1)
+        tags_layout.addWidget(self.no_import_tags_checkbox)
+
         form_layout.addRow(QLabel(" "))
         form_layout.addRow("Import to list:", root_list_layout)
         form_layout.addRow(
             default_tags_label,
-            self.tags_combo,
+            tags_layout,
         )
 
         self.button_box = QDialogButtonBox(
@@ -490,18 +563,58 @@ class UploadDialog(QDialog):
         self._update_root_list_state(
             self.import_to_root_checkbox.isChecked()
         )
+        self._update_generated_output_folders()
         self._update_move_folder_state()
+        self._update_tags_state(self.no_import_tags_checkbox.isChecked())
 
     def _update_root_list_state(self, import_to_root: bool) -> None:
         self.root_list_combo.setEnabled(not import_to_root)
 
+    def _handle_auto_generate_output_folders_toggled(self, checked: bool) -> None:
+        if checked:
+            self._manual_completed_folder = self.completed_field.text()
+            self._manual_error_folder = self.error_field.text()
+            self._update_generated_output_folders()
+        else:
+            self.completed_field.set_text(self._manual_completed_folder)
+            self.error_field.set_text(self._manual_error_folder)
+
+        self._update_move_folder_state()
+
     def _update_move_folder_state(self) -> None:
+        auto_generate = self.auto_generate_output_folders_checkbox.isChecked()
+        if auto_generate:
+            self._update_generated_output_folders()
+
         self.completed_field.setEnabled(
             not self.dont_move_completed_checkbox.isChecked()
+            and not auto_generate
         )
         self.error_field.setEnabled(
             not self.dont_move_failed_checkbox.isChecked()
+            and not auto_generate
         )
+
+    def _update_generated_output_folders(self) -> None:
+        if not self.auto_generate_output_folders_checkbox.isChecked():
+            return
+
+        upload_text = self.upload_field.text()
+        if not upload_text:
+            self.completed_field.set_text("")
+            self.error_field.set_text("")
+            return
+
+        upload_folder = Path(upload_text).expanduser()
+        self.completed_field.set_text(str(self._suffixed_folder(upload_folder, "_complete")))
+        self.error_field.set_text(str(self._suffixed_folder(upload_folder, "_error")))
+
+    def _update_tags_state(self, no_import_tags: bool) -> None:
+        self.tags_combo.setEnabled(not no_import_tags)
+
+    @staticmethod
+    def _suffixed_folder(folder: Path, suffix: str) -> Path:
+        return folder.with_name(folder.name + suffix)
 
     def _update_start_button_text(self, dry_run: bool) -> None:
         if dry_run:
@@ -521,6 +634,19 @@ class UploadDialog(QDialog):
             self.dont_preserve_move_structure_checkbox.isChecked()
         )
         move_conflict_mode = str(self.move_conflict_combo.currentData())
+        resize_images_if_needed = (
+            self.resize_images_if_needed_checkbox.isChecked()
+        )
+        auto_generate_output_folders = (
+            self.auto_generate_output_folders_checkbox.isChecked()
+        )
+        no_import_tags = self.no_import_tags_checkbox.isChecked()
+        omit_top_folder_list = self.omit_top_folder_list_checkbox.isChecked()
+
+        if auto_generate_output_folders:
+            self._update_generated_output_folders()
+            completed_text = self.completed_field.text()
+            error_text = self.error_field.text()
 
         if not upload_text:
             self._show_error("Folder to upload cannot be empty.")
@@ -601,10 +727,14 @@ class UploadDialog(QDialog):
             )
             return
 
-        tags = tuple(
-            tag.strip()
-            for tag in self.tags_combo.currentText().split(",")
-            if tag.strip()
+        tags = (
+            ()
+            if no_import_tags
+            else tuple(
+                tag.strip()
+                for tag in self.tags_combo.currentText().split(",")
+                if tag.strip()
+            )
         )
 
         self.configuration = UploadConfiguration(
@@ -623,6 +753,10 @@ class UploadDialog(QDialog):
             dont_move_failed=dont_move_failed,
             dont_preserve_move_structure=dont_preserve_move_structure,
             move_conflict_mode=move_conflict_mode,
+            resize_images_if_needed=resize_images_if_needed,
+            auto_generate_output_folders=auto_generate_output_folders,
+            no_import_tags=no_import_tags,
+            omit_top_folder_list=omit_top_folder_list,
             import_to_root=import_to_root,
             root_list=root_list,
             default_tags=tags,
@@ -634,9 +768,15 @@ class UploadDialog(QDialog):
 
     def _save_values(self) -> None:
         self.upload_field.save_current_value()
-        if not self.dont_move_completed_checkbox.isChecked():
+        if (
+            not self.dont_move_completed_checkbox.isChecked()
+            and not self.auto_generate_output_folders_checkbox.isChecked()
+        ):
             self.completed_field.save_current_value()
-        if not self.dont_move_failed_checkbox.isChecked():
+        if (
+            not self.dont_move_failed_checkbox.isChecked()
+            and not self.auto_generate_output_folders_checkbox.isChecked()
+        ):
             self.error_field.save_current_value()
 
         self._save_text_history(
@@ -656,6 +796,22 @@ class UploadDialog(QDialog):
         self.settings.setValue(
             "upload/dont_move_completed",
             self.dont_move_completed_checkbox.isChecked(),
+        )
+        self.settings.setValue(
+            "upload/resize_images_if_needed",
+            self.resize_images_if_needed_checkbox.isChecked(),
+        )
+        self.settings.setValue(
+            "upload/auto_generate_output_folders",
+            self.auto_generate_output_folders_checkbox.isChecked(),
+        )
+        self.settings.setValue(
+            "upload/no_import_tags",
+            self.no_import_tags_checkbox.isChecked(),
+        )
+        self.settings.setValue(
+            "upload/omit_top_folder_list",
+            self.omit_top_folder_list_checkbox.isChecked(),
         )
         self.settings.setValue(
             "upload/dont_move_failed",
@@ -1075,6 +1231,11 @@ class MainWindow(QMainWindow):
             self._log(f"Unable to read API key: {exc}", level="ERROR")
             return
 
+        self._log(
+            "================================",
+            message_color="START",
+            include_level=False,
+        )
         if config.dry_run:
             self._log(
                 "STARTING DRY-RUN.",
@@ -1085,7 +1246,6 @@ class MainWindow(QMainWindow):
                 "STARTING UPLOAD.",
                 message_color="START",
             )
-
         self._log(
             "================================",
             message_color="START",
@@ -1160,6 +1320,12 @@ class MainWindow(QMainWindow):
             self._log(
                 f"Destination root list: {config.root_list}"
             )
+        if config.omit_top_folder_list:
+            self._log("Top folder list: omitted.")
+        else:
+            self._log(
+                f"Top folder list: {config.upload_folder.name}"
+            )
 
         if config.default_tags:
             self._log(
@@ -1178,10 +1344,12 @@ class MainWindow(QMainWindow):
             dont_move_failed=config.dont_move_failed,
             dont_preserve_move_structure=config.dont_preserve_move_structure,
             move_conflict_mode=config.move_conflict_mode,
+            resize_images_if_needed=config.resize_images_if_needed,
             import_to_root=config.import_to_root,
             root_list=config.root_list,
             default_tags=config.default_tags,
             dry_run=config.dry_run,
+            omit_top_folder_list=config.omit_top_folder_list,
             image_resize_preferences=self.preferences.image_resize,
         )
 
@@ -1447,8 +1615,13 @@ class MainWindow(QMainWindow):
             self._log_completion_summary(include_not_processed=True)
         else:
             self.current_file_label.setText("Current file: complete")
+            complete_message = (
+                "DRY-RUN COMPLETE!"
+                if self.configuration is not None and self.configuration.dry_run
+                else "UPLOAD BATCH COMPLETE!"
+            )
             self._log(
-                "UPLOAD BATCH COMPLETE!",
+                complete_message,
                 level="SUCCESS",
                 message_color="SUCCESS",
             )

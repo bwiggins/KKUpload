@@ -12,6 +12,7 @@ import httpx
 from PySide6.QtCore import QObject, QThread, Qt, Signal
 from PySide6.QtGui import QImage
 
+from failure_inspector import investigate_unsupported_asset
 from karakeep_client import KarakeepClient, describe_http_error
 from list_planner import (
     ListIndex,
@@ -39,9 +40,11 @@ class UploadJobConfig:
     root_list: str
     default_tags: tuple[str, ...]
     dry_run: bool
+    omit_top_folder_list: bool = False
     image_resize_preferences: ImageResizePreferences = field(
         default_factory=ImageResizePreferences
     )
+    resize_images_if_needed: bool = True
 
 
 @dataclass
@@ -150,6 +153,8 @@ class UploadWorker(QObject):
                     scan_result.supported_files,
                     import_to_root=self.config.import_to_root,
                     root_list=self.config.root_list,
+                    top_folder_name=self.config.upload_folder.name,
+                    omit_top_folder_list=self.config.omit_top_folder_list,
                 )
 
                 total_files = len(plan.planned_files)
@@ -183,6 +188,7 @@ class UploadWorker(QObject):
                         processed_files,
                     )
 
+                self._log("Scanning step complete.")
                 self._log("================================", level="")
 
                 self._log("Retrieving Karakeep lists.")
@@ -202,6 +208,9 @@ class UploadWorker(QObject):
                     not_processed = total_files
                     self.finished.emit(True, succeeded, failed, not_processed)
                     return
+
+                self._log("List creation step complete.")
+                self._log("================================", level="")
 
                 if self.config.dry_run:
                     result = (
@@ -258,6 +267,12 @@ class UploadWorker(QObject):
         scan_result = scan_upload_folder(self.config.upload_folder)
         self._log(f"Found {len(scan_result.supported_files)} supported files.")
         self._log(f"Found {len(scan_result.unsupported_files)} unsupported files.")
+        for unsupported_file in scan_result.unsupported_files:
+            self._log(
+                f"Unsupported file: {unsupported_file}",
+                level="WARNING",
+                message_color="WARNING",
+            )
         self.unsupported_found.emit(len(scan_result.unsupported_files))
         return scan_result
 
@@ -305,11 +320,12 @@ class UploadWorker(QObject):
             if file.relative_path.parent.parts != current_folder_parts:
                 current_folder_parts = file.relative_path.parent.parts
                 self._log(
-                    "Entering folder: "
+                    "# Entering folder: "
                     + self._format_relative_folder(current_folder_parts),
                     message_color="START",
                 )
 
+            self._log("#### ")
             destination = format_list_path(file.destination_path)
             self._log(
                 f"Supported file: {file.file_path} -> {destination}"
@@ -338,6 +354,7 @@ class UploadWorker(QObject):
     ) -> tuple[int, int, int, int, bool] | None:
         succeeded = 0
         failed = 0
+        current_folder_parts: tuple[str, ...] | None = None
 
         for file in planned_files:
             if self._stop_requested:
@@ -349,6 +366,15 @@ class UploadWorker(QObject):
             if self._stop_requested:
                 return succeeded, failed, completed_operations, processed_files, True
 
+            if file.relative_path.parent.parts != current_folder_parts:
+                current_folder_parts = file.relative_path.parent.parts
+                self._log(
+                    "# Entering folder: "
+                    + self._format_relative_folder(current_folder_parts),
+                    message_color="START",
+                )
+
+            self._log("#### ")
             result = self._upload_file(
                 client,
                 list_index,
@@ -393,11 +419,12 @@ class UploadWorker(QObject):
 
         try:
             upload_path = self._prepare_upload_file(file.file_path, temp_folder)
-            self._log(
-                f"#### Uploading asset: {upload_path} "
-                f"({self._format_file_size(upload_path)})"
+            asset = self._upload_asset_with_resize_retry(
+                client,
+                file.file_path,
+                upload_path,
+                temp_folder,
             )
-            asset = client.upload_asset(upload_path)
             asset_id = str(asset["assetId"])
             completed_operations += 1
             self.progress.emit(
@@ -496,6 +523,8 @@ class UploadWorker(QObject):
                 level="ERROR",
                 message_color="ERROR",
             )
+            if self._is_unsupported_asset_type_error(exc):
+                self._investigate_unsupported_asset(file.file_path)
             self.failed_file.emit(str(file.file_path))
             self._try_move_failed_file(file)
             processed_files += 1
@@ -536,6 +565,9 @@ class UploadWorker(QObject):
         return True, completed_operations, processed_files
 
     def _prepare_upload_file(self, file_path: Path, temp_folder: Path) -> Path:
+        if not self.config.resize_images_if_needed:
+            return file_path
+
         preferences = self.config.image_resize_preferences
         file_size = file_path.stat().st_size
 
@@ -559,6 +591,47 @@ class UploadWorker(QObject):
             level="SUCCESS",
         )
         return resized_path
+
+    def _upload_asset_with_resize_retry(
+        self,
+        client: ClientProtocol,
+        original_path: Path,
+        upload_path: Path,
+        temp_folder: Path,
+    ) -> dict:
+        self._log_uploading_asset(upload_path)
+        try:
+            return client.upload_asset(upload_path)
+        except httpx.HTTPStatusError as exc:
+            if (
+                not self.config.resize_images_if_needed
+                or not self._is_too_large_error(exc)
+                or upload_path != original_path
+            ):
+                raise
+
+            self._log(
+                "Karakeep rejected the image as too large. "
+                "Attempting resize and retry.",
+                level="WARNING",
+            )
+            resized_path = self._resize_to_upload_limit(
+                original_path,
+                temp_folder,
+            )
+            self._log(
+                "Retrying with resized upload copy: "
+                f"{resized_path} ({self._format_file_size(resized_path)})",
+                level="WARNING",
+            )
+            self._log_uploading_asset(resized_path)
+            return client.upload_asset(resized_path)
+
+    def _log_uploading_asset(self, file_path: Path) -> None:
+        self._log(
+            f"Uploading asset: {file_path} "
+            f"({self._format_file_size(file_path)})"
+        )
 
     def _resize_to_upload_limit(self, file_path: Path, temp_folder: Path) -> Path:
         preferences = self.config.image_resize_preferences
@@ -635,6 +708,13 @@ class UploadWorker(QObject):
             )
 
         if best_under_goal is not None:
+            if preferences.fail_if_not_within_goal:
+                raise RuntimeError(
+                    "Unable to resize image within the acceptable distance "
+                    "from desired goal after "
+                    f"{preferences.maximum_attempts} attempts: {file_path}"
+                )
+
             self._log(
                 "Resize attempts did not land within the preferred distance, "
                 "but the best result is under the goal.",
@@ -646,6 +726,36 @@ class UploadWorker(QObject):
             "Unable to resize image under desired goal after "
             f"{preferences.maximum_attempts} attempts: {file_path}"
         )
+
+    @staticmethod
+    def _is_too_large_error(exc: httpx.HTTPStatusError) -> bool:
+        return exc.response.status_code == 413
+
+    @staticmethod
+    def _is_unsupported_asset_type_error(exc: httpx.HTTPStatusError) -> bool:
+        return (
+            exc.response.status_code == 400
+            and "unsupported asset type" in exc.response.text.casefold()
+        )
+
+    def _investigate_unsupported_asset(self, file_path: Path) -> None:
+        self._log(f"Investigating failed file: {file_path}")
+        try:
+            findings = investigate_unsupported_asset(file_path)
+        except Exception as exc:  # noqa: BLE001
+            self._log(
+                f"Unable to inspect failed file: {exc}",
+                level="WARNING",
+                message_color="WARNING",
+            )
+            return
+
+        for finding in findings:
+            self._log(
+                finding,
+                level="WARNING",
+                message_color="WARNING",
+            )
 
     @staticmethod
     def _format_file_size(file_path: Path) -> str:
