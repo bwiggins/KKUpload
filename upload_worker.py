@@ -1,13 +1,16 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import math
 from pathlib import Path
 import shutil
+import tempfile
 import threading
 from typing import Protocol
 
 import httpx
-from PySide6.QtCore import QObject, QThread, Signal
+from PySide6.QtCore import QObject, QThread, Qt, Signal
+from PySide6.QtGui import QImage
 
 from karakeep_client import KarakeepClient, describe_http_error
 from list_planner import (
@@ -17,6 +20,7 @@ from list_planner import (
     build_upload_plan,
     format_list_path,
 )
+from preferences import ImageResizePreferences
 from scanner import scan_upload_folder
 
 
@@ -35,6 +39,9 @@ class UploadJobConfig:
     root_list: str
     default_tags: tuple[str, ...]
     dry_run: bool
+    image_resize_preferences: ImageResizePreferences = field(
+        default_factory=ImageResizePreferences
+    )
 
 
 @dataclass
@@ -131,111 +138,114 @@ class UploadWorker(QObject):
         not_processed = 0
 
         try:
-            client = self._client or KarakeepClient(
-                self.config.server_url,
-                self.config.api_key,
-            )
-
-            scan_result = self._scan()
-            plan = build_upload_plan(
-                scan_result.supported_files,
-                import_to_root=self.config.import_to_root,
-                root_list=self.config.root_list,
-            )
-
-            total_files = len(plan.planned_files)
-            required_lists = plan.required_lists
-            pipeline_operation_count = total_files
-
-            if not self.config.dry_run:
-                pipeline_operation_count = sum(
-                    self._file_pipeline_operation_count(
-                        planned_file,
-                        move_kind="completed",
-                    )
-                    for planned_file in plan.planned_files
+            with tempfile.TemporaryDirectory(prefix="kkupload-") as temp_dir:
+                temp_folder = Path(temp_dir)
+                client = self._client or KarakeepClient(
+                    self.config.server_url,
+                    self.config.api_key,
                 )
 
-            total_operations = (
-                len(scan_result.scanned_folders)
-                + len(required_lists)
-                + pipeline_operation_count
-            )
-            self.progress_range.emit(total_operations, total_files)
-            completed_operations = 0
-            processed_files = 0
+                scan_result = self._scan()
+                plan = build_upload_plan(
+                    scan_result.supported_files,
+                    import_to_root=self.config.import_to_root,
+                    root_list=self.config.root_list,
+                )
 
-            for folder in scan_result.scanned_folders:
-                completed_operations += 1
-                self._log(f"Scanning folder: {folder}")
-                self.progress.emit(
+                total_files = len(plan.planned_files)
+                required_lists = plan.required_lists
+                pipeline_operation_count = total_files
+
+                if not self.config.dry_run:
+                    pipeline_operation_count = sum(
+                        self._file_pipeline_operation_count(
+                            planned_file,
+                            move_kind="completed",
+                        )
+                        for planned_file in plan.planned_files
+                    )
+
+                total_operations = (
+                    len(scan_result.scanned_folders)
+                    + len(required_lists)
+                    + pipeline_operation_count
+                )
+                self.progress_range.emit(total_operations, total_files)
+                completed_operations = 0
+                processed_files = 0
+
+                for folder in scan_result.scanned_folders:
+                    completed_operations += 1
+                    self._log(f"Scanning folder: {folder}")
+                    self.progress.emit(
+                        completed_operations,
+                        f"Scanning folder: {folder}",
+                        processed_files,
+                    )
+
+                self._log("================================", level="")
+
+                self._log("Retrieving Karakeep lists.")
+                existing_lists = client.list_lists()
+                self._log(f"Retrieved {len(existing_lists)} Karakeep lists.")
+                list_index = ListIndex(existing_lists)
+
+                completed_operations = self._resolve_lists(
+                    client,
+                    list_index,
+                    required_lists,
                     completed_operations,
-                    f"Scanning folder: {folder}",
                     processed_files,
                 )
+                if completed_operations is None:
+                    failed = 1
+                    not_processed = total_files
+                    self.finished.emit(True, succeeded, failed, not_processed)
+                    return
 
-            self._log("================================", level="")
+                if self.config.dry_run:
+                    result = (
+                        self._report_dry_run_files(
+                            plan.planned_files,
+                            total_files,
+                            completed_operations,
+                            processed_files,
+                        )
+                    )
+                    if result[0] is None:
+                        not_processed = total_files - processed_files
+                        self.finished.emit(True, 0, failed, not_processed)
+                        return
 
-            self._log("Retrieving Karakeep lists.")
-            existing_lists = client.list_lists()
-            self._log(f"Retrieved {len(existing_lists)} Karakeep lists.")
-            list_index = ListIndex(existing_lists)
-
-            completed_operations = self._resolve_lists(
-                client,
-                list_index,
-                required_lists,
-                completed_operations,
-                processed_files,
-            )
-            if completed_operations is None:
-                failed = 1
-                not_processed = total_files
-                self.finished.emit(True, succeeded, failed, not_processed)
-                return
-
-            if self.config.dry_run:
-                result = (
-                    self._report_dry_run_files(
+                    succeeded, completed_operations, processed_files = result
+                elif plan.planned_files:
+                    result = self._upload_files(
+                        client,
+                        list_index,
                         plan.planned_files,
                         total_files,
                         completed_operations,
                         processed_files,
+                        temp_folder,
                     )
-                )
-                if result[0] is None:
-                    not_processed = total_files - processed_files
-                    self.finished.emit(True, 0, failed, not_processed)
-                    return
+                    if result is None:
+                        not_processed = max(total_files - processed_files, 0)
+                        self.finished.emit(True, succeeded, failed, not_processed)
+                        return
 
-                succeeded, completed_operations, processed_files = result
-            elif plan.planned_files:
-                result = self._upload_files(
-                    client,
-                    list_index,
-                    plan.planned_files,
-                    total_files,
-                    completed_operations,
-                    processed_files,
-                )
-                if result is None:
+                    (
+                        succeeded,
+                        failed,
+                        completed_operations,
+                        processed_files,
+                        stopped,
+                    ) = result
                     not_processed = max(total_files - processed_files, 0)
-                    self.finished.emit(True, succeeded, failed, not_processed)
-                    return
-
-                (
-                    succeeded,
-                    failed,
-                    completed_operations,
-                    processed_files,
-                    stopped,
-                ) = result
-                not_processed = max(total_files - processed_files, 0)
-                if stopped:
-                    self.finished.emit(True, succeeded, failed, not_processed)
-                    return
-            else:
-                self._log("No supported files found.")
+                    if stopped:
+                        self.finished.emit(True, succeeded, failed, not_processed)
+                        return
+                else:
+                    self._log("No supported files found.")
 
             self.finished.emit(False, succeeded, failed, not_processed)
         except Exception as exc:  # noqa: BLE001
@@ -324,6 +334,7 @@ class UploadWorker(QObject):
         total_files: int,
         completed_operations: int,
         processed_files: int,
+        temp_folder: Path,
     ) -> tuple[int, int, int, int, bool] | None:
         succeeded = 0
         failed = 0
@@ -344,6 +355,7 @@ class UploadWorker(QObject):
                 file,
                 completed_operations,
                 processed_files,
+                temp_folder,
             )
             if result is None:
                 failed += 1
@@ -372,14 +384,20 @@ class UploadWorker(QObject):
         file,
         completed_operations: int,
         processed_files: int,
+        temp_folder: Path,
     ) -> tuple[bool, int, int] | None:
+        file_start_operations = completed_operations
         destination = format_list_path(file.destination_path)
         self._log(f"Uploading supported file: {file.file_path}")
         self._log(f"Destination list: {destination}")
 
         try:
-            self._log(f"#### Uploading asset: {file.file_path}")
-            asset = client.upload_asset(file.file_path)
+            upload_path = self._prepare_upload_file(file.file_path, temp_folder)
+            self._log(
+                f"#### Uploading asset: {upload_path} "
+                f"({self._format_file_size(upload_path)})"
+            )
+            asset = client.upload_asset(upload_path)
             asset_id = str(asset["assetId"])
             completed_operations += 1
             self.progress.emit(
@@ -481,7 +499,12 @@ class UploadWorker(QObject):
             self.failed_file.emit(str(file.file_path))
             self._try_move_failed_file(file)
             processed_files += 1
-            completed_operations += 1
+            completed_operations = file_start_operations + (
+                self._file_pipeline_operation_count(
+                    file,
+                    move_kind="completed",
+                )
+            )
             self.progress.emit(
                 completed_operations,
                 f"Handled failed file: {file.file_path}",
@@ -497,7 +520,12 @@ class UploadWorker(QObject):
             self.failed_file.emit(str(file.file_path))
             self._try_move_failed_file(file)
             processed_files += 1
-            completed_operations += 1
+            completed_operations = file_start_operations + (
+                self._file_pipeline_operation_count(
+                    file,
+                    move_kind="completed",
+                )
+            )
             self.progress.emit(
                 completed_operations,
                 f"Handled failed file: {file.file_path}",
@@ -506,6 +534,138 @@ class UploadWorker(QObject):
             return False, completed_operations, processed_files
 
         return True, completed_operations, processed_files
+
+    def _prepare_upload_file(self, file_path: Path, temp_folder: Path) -> Path:
+        preferences = self.config.image_resize_preferences
+        file_size = file_path.stat().st_size
+
+        if file_size <= preferences.maximum_allowed_bytes:
+            return file_path
+
+        self._log(
+            "File exceeds maximum allowed image size: "
+            f"{file_path} ({self._format_file_size(file_path)} > "
+            f"{preferences.maximum_allowed_image_size_mb:g} MB)",
+            level="WARNING",
+        )
+
+        resized_path = self._resize_to_upload_limit(
+            file_path,
+            temp_folder,
+        )
+        self._log(
+            "Using resized upload copy: "
+            f"{resized_path} ({self._format_file_size(resized_path)})",
+            level="SUCCESS",
+        )
+        return resized_path
+
+    def _resize_to_upload_limit(self, file_path: Path, temp_folder: Path) -> Path:
+        preferences = self.config.image_resize_preferences
+        image = QImage(str(file_path))
+        if image.isNull():
+            raise RuntimeError(f"Unable to load image for resizing: {file_path}")
+
+        original_width = image.width()
+        original_height = image.height()
+        original_size = file_path.stat().st_size
+        high_scale = 1.0
+        scale = min(
+            0.98,
+            math.sqrt(preferences.desired_goal_bytes / original_size) * 0.98,
+        )
+        best_under_goal: Path | None = None
+
+        for attempt in range(1, preferences.maximum_attempts + 1):
+            scale = max(scale, 0.01)
+            target_width = max(1, int(original_width * scale))
+            target_height = max(1, int(original_height * scale))
+            resized = image.scaled(
+                target_width,
+                target_height,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            resized_path = (
+                temp_folder
+                / f"{file_path.stem}.resized-{attempt}{file_path.suffix}"
+            )
+
+            self._log(
+                "Resize attempt "
+                f"{attempt}: {original_width}x{original_height} -> "
+                f"{resized.width()}x{resized.height()}"
+            )
+
+            if not resized.save(str(resized_path)):
+                raise RuntimeError(
+                    f"Unable to save resized image copy: {resized_path}"
+                )
+
+            resized_size = resized_path.stat().st_size
+            self._log(
+                f"Resize attempt {attempt} size: "
+                f"{self._format_file_size(resized_path)}"
+            )
+
+            if resized_size <= preferences.desired_goal_bytes:
+                best_under_goal = resized_path
+                if resized_size >= preferences.minimum_acceptable_bytes:
+                    self._log(
+                        "Resize result is within acceptable range: "
+                        f"{self._format_file_size(resized_path)}"
+                    )
+                    return resized_path
+
+                self._log(
+                    "Resize result is under the goal but outside the "
+                    "preferred distance. Trying closer if attempts remain.",
+                    level="WARNING",
+                )
+                scale = (scale + high_scale) / 2
+                continue
+
+            self._log(
+                "Resize result is still over the desired goal.",
+                level="WARNING",
+            )
+            high_scale = scale
+            scale *= (
+                math.sqrt(preferences.desired_goal_bytes / resized_size) * 0.98
+            )
+
+        if best_under_goal is not None:
+            self._log(
+                "Resize attempts did not land within the preferred distance, "
+                "but the best result is under the goal.",
+                level="WARNING",
+            )
+            return best_under_goal
+
+        raise RuntimeError(
+            "Unable to resize image under desired goal after "
+            f"{preferences.maximum_attempts} attempts: {file_path}"
+        )
+
+    @staticmethod
+    def _format_file_size(file_path: Path) -> str:
+        try:
+            size = file_path.stat().st_size
+        except OSError:
+            return "unknown size"
+
+        units = ("B", "KB", "MB", "GB", "TB")
+        value = float(size)
+        unit_index = 0
+
+        while value >= 1024 and unit_index < len(units) - 1:
+            value /= 1024
+            unit_index += 1
+
+        if unit_index == 0:
+            return f"{size} B"
+
+        return f"{value:.1f} {units[unit_index]}"
 
     def _try_move_failed_file(self, file) -> None:
         try:

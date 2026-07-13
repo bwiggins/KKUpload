@@ -41,6 +41,7 @@ from PySide6.QtWidgets import (
 )
 
 from karakeep_client import KarakeepClient
+from preferences import AppPreferences, load_preferences
 from scanner import validate_separate_folder_tree
 from upload_worker import MoveConflictRequest, UploadJobConfig, UploadWorker
 
@@ -881,6 +882,8 @@ class MainWindow(QMainWindow):
             ORGANIZATION_NAME,
             APP_NAME,
         )
+        preference_load_result = load_preferences(Path(__file__))
+        self.preferences: AppPreferences = preference_load_result.preferences
 
         self.configuration: UploadConfiguration | None = None
         self.current_index = 0
@@ -977,6 +980,8 @@ class MainWindow(QMainWindow):
         self._restore_window_state()
         self._update_connection_state()
         self._log("KKUpload ready.")
+        for message, level in preference_load_result.messages:
+            self._log(message, level=level)
         QTimer.singleShot(0, self._prompt_for_connection_if_needed)
 
     def _open_connection_settings(self) -> bool:
@@ -1177,6 +1182,7 @@ class MainWindow(QMainWindow):
             root_list=config.root_list,
             default_tags=config.default_tags,
             dry_run=config.dry_run,
+            image_resize_preferences=self.preferences.image_resize,
         )
 
         self.worker_thread = QThread(self)
@@ -1344,21 +1350,23 @@ class MainWindow(QMainWindow):
         self.summary_label.setText(
             f"Succeeded: {self.succeeded_count}&nbsp;&nbsp;&nbsp;&nbsp;"
             f"Failed: {failed_text}&nbsp;&nbsp;&nbsp;&nbsp;"
-            "Conflicts: "
-            f"<span style='color: {colors['WARNING']};'>"
-            f"{self.resolved_conflict_count}</span>&nbsp;&nbsp;&nbsp;&nbsp;"
+            f"Conflicts: {self._format_warning_count(self.resolved_conflict_count)}"
+            "&nbsp;&nbsp;&nbsp;&nbsp;"
             f"Unsupported: {self._format_unsupported_count()}&nbsp;&nbsp;&nbsp;&nbsp;"
             f"Remaining: {remaining}"
         )
 
     def _format_unsupported_count(self) -> str:
-        if self.unsupported_count <= 0:
+        return self._format_warning_count(self.unsupported_count)
+
+    def _format_warning_count(self, count: int) -> str:
+        if count <= 0:
             return "0"
 
         warning_color = self._console_log_colors()["WARNING"]
         return (
             f"<span style='color: {warning_color};'>"
-            f"{self.unsupported_count}</span>"
+            f"{count}</span>"
         )
 
     def _log_completion_summary(

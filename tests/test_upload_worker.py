@@ -5,6 +5,8 @@ import unittest
 from pathlib import Path
 
 from list_planner import ListRecord
+from preferences import ImageResizePreferences
+from PySide6.QtGui import QImage
 from upload_worker import UploadJobConfig, UploadWorker
 
 
@@ -39,6 +41,7 @@ class SuccessfulUploadClient:
         self.records: dict[tuple[str | None, str], ListRecord] = {}
         self.created_lists: list[tuple[str, str | None]] = []
         self.uploaded_files: list[Path] = []
+        self.uploaded_file_sizes: list[int] = []
         self.created_bookmarks: list[tuple[str, str]] = []
         self.assigned_lists: list[tuple[str, str]] = []
         self.attached_tags: list[tuple[str, tuple[str, ...]]] = []
@@ -66,6 +69,7 @@ class SuccessfulUploadClient:
 
     def upload_asset(self, file_path: Path) -> dict:
         self.uploaded_files.append(file_path)
+        self.uploaded_file_sizes.append(file_path.stat().st_size)
         self.asset_counter += 1
         return {"assetId": f"asset-{self.asset_counter}"}
 
@@ -315,6 +319,55 @@ class UploadWorkerTests(unittest.TestCase):
             self.assertTrue((completed_folder / "alpha.jpg").exists())
             self.assertFalse((upload_folder / "beta.jpg").exists())
             self.assertTrue((completed_folder / "beta.jpg").exists())
+
+    def test_live_upload_resizes_oversized_image_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            upload_folder = root / "upload"
+            completed_folder = root / "completed"
+            upload_folder.mkdir()
+            image_path = upload_folder / "large.bmp"
+
+            image = QImage(300, 300, QImage.Format.Format_RGB32)
+            image.fill(0xFF336699)
+            self.assertTrue(image.save(str(image_path)))
+
+            client = SuccessfulUploadClient()
+            worker = UploadWorker(
+                UploadJobConfig(
+                    server_url="https://karakeep.example.test",
+                    api_key="token",
+                    upload_folder=upload_folder,
+                    completed_folder=completed_folder,
+                    error_folder=root / "errors",
+                    dont_move_completed=False,
+                    dont_move_failed=False,
+                    dont_preserve_move_structure=False,
+                    move_conflict_mode="ask",
+                    import_to_root=False,
+                    root_list="IMPORT SORTING",
+                    default_tags=(),
+                    dry_run=False,
+                    image_resize_preferences=ImageResizePreferences(
+                        maximum_allowed_image_size_mb=0.1,
+                        desired_resize_goal_mb=0.05,
+                        maximum_attempts=3,
+                        acceptable_distance_percent=25,
+                    ),
+                ),
+                client=client,
+            )
+
+            worker.run()
+
+            self.assertEqual(len(client.uploaded_files), 1)
+            self.assertNotEqual(client.uploaded_files[0], image_path.resolve())
+            self.assertLess(
+                client.uploaded_file_sizes[0],
+                (completed_folder / "large.bmp").stat().st_size,
+            )
+            self.assertFalse(image_path.exists())
+            self.assertTrue((completed_folder / "large.bmp").exists())
 
     def test_live_upload_preserves_relative_move_structure(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

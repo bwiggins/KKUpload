@@ -1,0 +1,8 @@
+{
+  "image_resize": {
+    "maximum_allowed_image_size_mb": 49.0,
+    "desired_resize_goal_mb": 25.0,
+    "maximum_attempts": 3,
+    "acceptable_distance_percent": 10.0
+  }
+}
