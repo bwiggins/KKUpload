@@ -725,6 +725,88 @@ class UploadWorkerTests(unittest.TestCase):
                 (error_folder / "fart" / "burp" / "poop.jpg").exists()
             )
 
+    def test_live_upload_moves_unsupported_file_to_unsupported_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            upload_folder = root / "upload"
+            unsupported_folder = root / "unsupported"
+            nested_folder = upload_folder / "fart" / "burp"
+            nested_folder.mkdir(parents=True)
+            unsupported_file = nested_folder / "poop.txt"
+            unsupported_file.write_text("x")
+
+            worker = UploadWorker(
+                UploadJobConfig(
+                    server_url="https://karakeep.example.test",
+                    api_key="token",
+                    upload_folder=upload_folder,
+                    completed_folder=root / "completed",
+                    error_folder=root / "errors",
+                    dont_move_completed=False,
+                    dont_move_failed=False,
+                    dont_preserve_move_structure=False,
+                    move_conflict_mode="ask",
+                    import_to_root=False,
+                    root_list="IMPORT SORTING",
+                    default_tags=(),
+                    dry_run=False,
+                    unsupported_folder=unsupported_folder,
+                    dont_move_unsupported=False,
+                ),
+                client=EmptyDryRunClient(),
+            )
+
+            worker.run()
+
+            self.assertFalse(unsupported_file.exists())
+            self.assertTrue(
+                (unsupported_folder / "fart" / "burp" / "poop.txt").exists()
+            )
+
+    def test_dry_run_reports_unsupported_move_without_moving(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            upload_folder = root / "upload"
+            unsupported_folder = root / "unsupported"
+            upload_folder.mkdir()
+            unsupported_file = upload_folder / "poop.txt"
+            unsupported_file.write_text("x")
+
+            worker = UploadWorker(
+                UploadJobConfig(
+                    server_url="https://karakeep.example.test",
+                    api_key="token",
+                    upload_folder=upload_folder,
+                    completed_folder=root / "completed",
+                    error_folder=root / "errors",
+                    dont_move_completed=False,
+                    dont_move_failed=False,
+                    dont_preserve_move_structure=False,
+                    move_conflict_mode="ask",
+                    import_to_root=False,
+                    root_list="IMPORT SORTING",
+                    default_tags=(),
+                    dry_run=True,
+                    unsupported_folder=unsupported_folder,
+                    dont_move_unsupported=False,
+                ),
+                client=EmptyDryRunClient(),
+            )
+
+            log_messages: list[str] = []
+            worker.log.connect(
+                lambda message, level, message_color: log_messages.append(message)
+            )
+
+            worker.run()
+
+            self.assertTrue(unsupported_file.exists())
+            self.assertFalse((unsupported_folder / "poop.txt").exists())
+            self.assertIn(
+                f"Dry-run: would move unsupported file to: {unsupported_folder / 'poop.txt'}",
+                "\n".join(log_messages),
+            )
+
     def test_unsupported_asset_type_investigates_failed_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

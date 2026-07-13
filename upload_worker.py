@@ -40,6 +40,8 @@ class UploadJobConfig:
     root_list: str
     default_tags: tuple[str, ...]
     dry_run: bool
+    unsupported_folder: Path | None = None
+    dont_move_unsupported: bool = False
     omit_top_folder_list: bool = False
     image_resize_preferences: ImageResizePreferences = field(
         default_factory=ImageResizePreferences
@@ -63,6 +65,12 @@ class MoveConflictRequest:
         self.choice = choice
         self.apply_to_all = apply_to_all
         self.resolved.set()
+
+
+@dataclass(frozen=True)
+class LocalMoveFile:
+    file_path: Path
+    relative_path: Path
 
 
 class ClientProtocol(Protocol):
@@ -273,6 +281,26 @@ class UploadWorker(QObject):
                 level="WARNING",
                 message_color="WARNING",
             )
+            local_file = LocalMoveFile(
+                file_path=unsupported_file,
+                relative_path=unsupported_file.relative_to(
+                    self.config.upload_folder
+                ),
+            )
+            if self.config.dry_run:
+                self._log_planned_move(local_file, "unsupported")
+            else:
+                try:
+                    self._move_processed_file(local_file, "unsupported")
+                except Exception as exc:  # noqa: BLE001
+                    self._log(
+                        "Unsupported file could not be moved: "
+                        f"{unsupported_file} ({exc})",
+                        level="ERROR",
+                        message_color="ERROR",
+                    )
+            if self._stop_requested:
+                break
         self.unsupported_found.emit(len(scan_result.unsupported_files))
         return scan_result
 
@@ -948,6 +976,11 @@ class UploadWorker(QObject):
             if self.config.dont_move_failed:
                 return None
             return self.config.error_folder
+
+        if kind == "unsupported":
+            if self.config.dont_move_unsupported:
+                return None
+            return self.config.unsupported_folder
 
         raise ValueError(f"Unknown move kind: {kind}")
 
