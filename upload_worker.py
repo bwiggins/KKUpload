@@ -121,7 +121,7 @@ class UploadWorker(QObject):
     move_conflict = Signal(object)
     conflict_resolved = Signal(int)
     unsupported_found = Signal(int)
-    failed_file = Signal(str)
+    failed_file = Signal(str, str)
     finished = Signal(bool, int, int, int)
 
     def __init__(
@@ -353,7 +353,7 @@ class UploadWorker(QObject):
                     message_color="START",
                 )
 
-            self._log("#### ")
+            self._log("###### ", level="")
             destination = format_list_path(file.destination_path)
             self._log(
                 f"Supported file: {file.file_path} -> {destination}"
@@ -402,7 +402,7 @@ class UploadWorker(QObject):
                     message_color="START",
                 )
 
-            self._log("#### ")
+            self._log("###### ", level="")
             result = self._upload_file(
                 client,
                 list_index,
@@ -545,15 +545,16 @@ class UploadWorker(QObject):
                     processed_files,
                 )
         except httpx.HTTPStatusError as exc:
+            failure_reason = describe_http_error(exc)
             self._log(
                 "Upload failed: "
-                f"{file.file_path} ({describe_http_error(exc)})",
+                f"{file.file_path} ({failure_reason})",
                 level="ERROR",
                 message_color="ERROR",
             )
             if self._is_unsupported_asset_type_error(exc):
                 self._investigate_unsupported_asset(file.file_path)
-            self.failed_file.emit(str(file.file_path))
+            self.failed_file.emit(str(file.file_path), failure_reason)
             self._try_move_failed_file(file)
             processed_files += 1
             completed_operations = file_start_operations + (
@@ -569,12 +570,13 @@ class UploadWorker(QObject):
             )
             return False, completed_operations, processed_files
         except Exception as exc:  # noqa: BLE001
+            failure_reason = str(exc)
             self._log(
-                f"Upload failed: {file.file_path} ({exc})",
+                f"Upload failed: {file.file_path} ({failure_reason})",
                 level="ERROR",
                 message_color="ERROR",
             )
-            self.failed_file.emit(str(file.file_path))
+            self.failed_file.emit(str(file.file_path), failure_reason)
             self._try_move_failed_file(file)
             processed_files += 1
             completed_operations = file_start_operations + (

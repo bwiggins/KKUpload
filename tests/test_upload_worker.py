@@ -403,10 +403,16 @@ class UploadWorkerTests(unittest.TestCase):
             upload_folder = root / "upload"
             completed_folder = root / "completed"
             upload_folder.mkdir()
-            image_path = upload_folder / "large.bmp"
+            image_path = upload_folder / "large.png"
 
-            image = QImage(300, 300, QImage.Format.Format_RGB32)
-            image.fill(0xFF336699)
+            image = QImage(1024, 1024, QImage.Format.Format_RGB32)
+            for y in range(image.height()):
+                for x in range(image.width()):
+                    color = (
+                        (x * 1103515245 + y * 12345 + (x * y * 2654435761))
+                        & 0x00FFFFFF
+                    )
+                    image.setPixel(x, y, 0xFF000000 | color)
             self.assertTrue(image.save(str(image_path)))
 
             client = SuccessfulUploadClient()
@@ -441,10 +447,10 @@ class UploadWorkerTests(unittest.TestCase):
             self.assertNotEqual(client.uploaded_files[0], image_path.resolve())
             self.assertLess(
                 client.uploaded_file_sizes[0],
-                (completed_folder / "large.bmp").stat().st_size,
+                (completed_folder / "large.png").stat().st_size,
             )
             self.assertFalse(image_path.exists())
-            self.assertTrue((completed_folder / "large.bmp").exists())
+            self.assertTrue((completed_folder / "large.png").exists())
 
     def test_live_upload_retries_with_resize_after_too_large_response(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -452,10 +458,16 @@ class UploadWorkerTests(unittest.TestCase):
             upload_folder = root / "upload"
             completed_folder = root / "completed"
             upload_folder.mkdir()
-            image_path = upload_folder / "large.bmp"
+            image_path = upload_folder / "large.png"
 
-            image = QImage(300, 300, QImage.Format.Format_RGB32)
-            image.fill(0xFF663399)
+            image = QImage(1024, 1024, QImage.Format.Format_RGB32)
+            for y in range(image.height()):
+                for x in range(image.width()):
+                    color = (
+                        (x * 1664525 + y * 1013904223 + (x * y * 2246822519))
+                        & 0x00FFFFFF
+                    )
+                    image.setPixel(x, y, 0xFF000000 | color)
             self.assertTrue(image.save(str(image_path)))
 
             client = TooLargeOnceUploadClient()
@@ -495,7 +507,7 @@ class UploadWorkerTests(unittest.TestCase):
                 client.uploaded_file_sizes[0],
             )
             self.assertFalse(image_path.exists())
-            self.assertTrue((completed_folder / "large.bmp").exists())
+            self.assertTrue((completed_folder / "large.png").exists())
 
     def test_live_upload_preserves_relative_move_structure(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -13,6 +13,7 @@ class ScannerTests(unittest.TestCase):
             root = Path(temp_dir)
             (root / "root.jpg").write_text("x")
             (root / "ignore.txt").write_text("x")
+            (root / "karakeep_rejects_bmp.bmp").write_text("x")
             (root / "Models" / "Rose").mkdir(parents=True)
             (root / "Models" / "Rose" / "pose.PNG").write_text("x")
 
@@ -32,7 +33,10 @@ class ScannerTests(unittest.TestCase):
                 str(path.relative_to(root)).replace("\\", "/")
                 for path in result.unsupported_files
             }
-            self.assertEqual(unsupported_paths, {"ignore.txt"})
+            self.assertEqual(
+                unsupported_paths,
+                {"ignore.txt", "karakeep_rejects_bmp.bmp"},
+            )
 
     def test_rejects_any_nested_folder_relationship(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -9,7 +10,7 @@ from pathlib import Path
 from typing import Final
 
 import keyring
-from PySide6.QtCore import QSettings, QSize, QThread, QTimer, Qt
+from PySide6.QtCore import QSettings, QSize, QThread, QTimer, Qt, Signal
 from PySide6.QtGui import (
     QColor,
     QCloseEvent,
@@ -449,9 +450,6 @@ class UploadDialog(QDialog):
         move_options_layout.addWidget(QLabel("On file move conflict:"))
         move_options_layout.addWidget(self.move_conflict_combo)
 
-        upload_spacing = QWidget()
-        upload_spacing.setFixedHeight(6)
-
         self.root_list_combo = QComboBox()
         self.root_list_combo.setEditable(True)
         self.root_list_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
@@ -535,7 +533,7 @@ class UploadDialog(QDialog):
 
         form_layout.addRow("Folder to upload:", self.upload_field)
         form_layout.addRow("", upload_options_layout)
-        form_layout.addRow("", upload_spacing)
+        form_layout.addRow(QLabel(" "))
         form_layout.addRow(self._section_label("Move files after processing"))
         form_layout.addRow("Completed folder:", completed_layout)
         form_layout.addRow("Error folder:", error_layout)
@@ -642,18 +640,22 @@ class UploadDialog(QDialog):
             return
 
         upload_folder = Path(upload_text).expanduser()
-        self.completed_field.set_text(str(self._suffixed_folder(upload_folder, "_complete")))
-        self.error_field.set_text(str(self._suffixed_folder(upload_folder, "_error")))
+        self.completed_field.set_text(
+            str(self._generated_output_folder(upload_folder, "SUCCESS"))
+        )
+        self.error_field.set_text(
+            str(self._generated_output_folder(upload_folder, "FAIL"))
+        )
         self.unsupported_field.set_text(
-            str(self._suffixed_folder(upload_folder, "_unsupported"))
+            str(self._generated_output_folder(upload_folder, "UNSUP"))
         )
 
     def _update_tags_state(self, no_import_tags: bool) -> None:
         self.tags_combo.setEnabled(not no_import_tags)
 
     @staticmethod
-    def _suffixed_folder(folder: Path, suffix: str) -> Path:
-        return folder.with_name(folder.name + suffix)
+    def _generated_output_folder(upload_folder: Path, category: str) -> Path:
+        return upload_folder.parent / "KKU" / category / upload_folder.name
 
     @staticmethod
     def _section_label(text: str) -> QLabel:
@@ -1114,6 +1116,8 @@ class StatusConsole(QPlainTextEdit):
 class LogMarkerRail(QWidget):
     """Full-log marker rail for warnings, errors, and major start lines."""
 
+    marker_clicked = Signal(int)
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._markers: list[tuple[int, str]] = []
@@ -1153,22 +1157,73 @@ class LogMarkerRail(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
 
-        height = max(self.height() - 1, 1)
-        denominator = max(self._total_lines - self._visible_lines, 1)
         colors = self._marker_colors()
+        top_inset = 16
 
-        for line_number, marker_type in self._markers:
-            scroll_position = min(line_number, denominator)
-            y = int((scroll_position / denominator) * height)
+        for y, marker_type in sorted(
+            self._marker_positions(),
+            key=lambda marker: self._marker_priority(marker[1]),
+        ):
+            marker_height = 6 if marker_type == "SUCCESS" else 3
+            marker_width = 9 if marker_type == "SUCCESS" else 5
+            marker_width = min(marker_width, self.width())
+            marker_x = (self.width() - marker_width) // 2
             painter.fillRect(
-                2,
-                max(0, y - 1),
-                self.width() - 4,
-                3,
+                marker_x,
+                max(top_inset, y - marker_height // 2),
+                marker_width,
+                marker_height,
                 QColor(colors.get(marker_type, colors["START"])),
             )
 
         painter.end()
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if not self._markers:
+            return
+
+        click_y = event.position().y()
+        hit_radius = 10
+        nearest_marker: tuple[int, int] | None = None
+
+        for line_number, marker_type in self._markers:
+            marker_y = self._marker_y(line_number)
+            distance = abs(marker_y - click_y)
+            if distance > hit_radius:
+                continue
+            if nearest_marker is None or distance < nearest_marker[0]:
+                nearest_marker = (int(distance), line_number)
+
+        if nearest_marker is not None:
+            self.marker_clicked.emit(nearest_marker[1])
+
+    def _marker_positions(self) -> list[tuple[int, str]]:
+        return [
+            (self._marker_y(line_number), marker_type)
+            for line_number, marker_type in self._markers
+        ]
+
+    def _marker_y(self, line_number: int) -> int:
+        top_inset = 16
+        bottom_inset = 22
+        usable_height = max(self.height() - top_inset - bottom_inset - 1, 1)
+        denominator = max(self._total_lines - self._visible_lines, 1)
+        half_viewport = self._visible_lines / 2
+        scroll_position = min(
+            max(line_number - half_viewport, 0),
+            denominator,
+        )
+        return top_inset + int((scroll_position / denominator) * usable_height)
+
+    @staticmethod
+    def _marker_priority(marker_type: str) -> int:
+        priorities = {
+            "START": 0,
+            "WARNING": 1,
+            "ERROR": 2,
+            "SUCCESS": 3,
+        }
+        return priorities.get(marker_type, 0)
 
     def _marker_colors(self) -> dict[str, str]:
         base_color = self.palette().base().color()
@@ -1179,14 +1234,14 @@ class LogMarkerRail(QWidget):
                 "ERROR": "#f87171",
                 "WARNING": "#facc15",
                 "START": "#7dd3fc",
-                "SUCCESS": "#4ade80",
+                "SUCCESS": "#22c55e",
             }
 
         return {
             "ERROR": "#b91c1c",
             "WARNING": "#ca8a04",
             "START": "#0284c7",
-            "SUCCESS": "#15803d",
+            "SUCCESS": "#166534",
         }
 
 
@@ -1210,10 +1265,11 @@ class MainWindow(QMainWindow):
         self.not_processed_count = 0
         self.resolved_conflict_count = 0
         self.unsupported_count = 0
-        self.failed_files: list[str] = []
+        self.failed_files: list[tuple[str, str]] = []
         self.completed_operations = 0
         self.total_operations = 0
         self.total_files = 0
+        self.job_started_at: float | None = None
         self.stop_requested = False
         self.is_paused = False
         self.is_running = False
@@ -1268,6 +1324,9 @@ class MainWindow(QMainWindow):
         console_font.setStyleHint(QFont.StyleHint.Monospace)
         self.console.setFont(console_font)
         self.console_marker_rail = LogMarkerRail()
+        self.console_marker_rail.marker_clicked.connect(
+            self._scroll_console_to_line
+        )
 
         self.current_file_label = QLabel("Current file: —")
         self.progress_bar = QProgressBar()
@@ -1278,6 +1337,7 @@ class MainWindow(QMainWindow):
         self.summary_label = QLabel(
             "Succeeded: 0    Failed: 0    Remaining: 0"
         )
+        self.summary_label.setTextFormat(Qt.TextFormat.RichText)
         self.clear_console_button = QPushButton("Clear Console")
         self.clear_console_button.clicked.connect(self._clear_console)
 
@@ -1432,6 +1492,7 @@ class MainWindow(QMainWindow):
         self.completed_operations = 0
         self.total_operations = 0
         self.total_files = 0
+        self.job_started_at = time.monotonic()
         self.stop_requested = False
         self.is_paused = False
         self.is_running = True
@@ -1578,8 +1639,8 @@ class MainWindow(QMainWindow):
         if not self.log_flush_timer.isActive():
             self.log_flush_timer.start()
 
-    def _handle_failed_file(self, relative_path: str) -> None:
-        self.failed_files.append(relative_path)
+    def _handle_failed_file(self, relative_path: str, reason: str) -> None:
+        self.failed_files.append((relative_path, reason))
         self.failed_count += 1
         self._update_summary()
 
@@ -1698,14 +1759,47 @@ class MainWindow(QMainWindow):
                 f"{self.failed_count}</span>"
             )
 
+        eta_text = self._format_eta()
+
         self.summary_label.setText(
             f"Succeeded: {self.succeeded_count}&nbsp;&nbsp;&nbsp;&nbsp;"
             f"Failed: {failed_text}&nbsp;&nbsp;&nbsp;&nbsp;"
             f"Conflicts: {self._format_warning_count(self.resolved_conflict_count)}"
             "&nbsp;&nbsp;&nbsp;&nbsp;"
             f"Unsupported: {self._format_unsupported_count()}&nbsp;&nbsp;&nbsp;&nbsp;"
-            f"Remaining: {remaining}"
+            f"Remaining: {remaining}&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"
+            f"ETA: {eta_text}"
         )
+
+    def _format_eta(self) -> str:
+        if (
+            not self.is_running
+            or self.job_started_at is None
+            or self.completed_operations <= 0
+            or self.total_operations <= 0
+        ):
+            return "--"
+
+        remaining_operations = max(
+            self.total_operations - self.completed_operations,
+            0,
+        )
+        if remaining_operations <= 0:
+            return "00:00"
+
+        elapsed = max(time.monotonic() - self.job_started_at, 0.1)
+        seconds_per_operation = elapsed / self.completed_operations
+        remaining_seconds = int(round(seconds_per_operation * remaining_operations))
+        return self._format_duration(remaining_seconds)
+
+    @staticmethod
+    def _format_duration(total_seconds: int) -> str:
+        total_seconds = max(total_seconds, 0)
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        if hours:
+            return f"{hours:d}:{minutes:02d}:{seconds:02d}"
+        return f"{minutes:02d}:{seconds:02d}"
 
     def _format_unsupported_count(self) -> str:
         return self._format_warning_count(self.unsupported_count)
@@ -1742,12 +1836,16 @@ class MainWindow(QMainWindow):
 
         if self.failed_files:
             self._log("Failed files:", message_color="ERROR")
-            for failed_file in self.failed_files:
-                self._log(f"- {failed_file}", message_color="ERROR")
+            for failed_file, reason in self.failed_files:
+                self._log(
+                    f"- {failed_file} ({reason})",
+                    message_color="ERROR",
+                )
 
         self._log_blank_lines(2)
 
     def _log_blank_lines(self, count: int) -> None:
+        should_auto_scroll = self._console_should_auto_scroll()
         cursor = self.console.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
 
@@ -1755,8 +1853,9 @@ class MainWindow(QMainWindow):
             cursor.insertBlock()
 
         self._update_console_marker_metrics()
-        scrollbar = self.console.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
+        if should_auto_scroll:
+            scrollbar = self.console.verticalScrollBar()
+            scrollbar.setValue(scrollbar.maximum())
 
     def _flush_pending_logs(self, flush_all: bool = False) -> None:
         if flush_all:
@@ -1819,6 +1918,7 @@ class MainWindow(QMainWindow):
         include_prefix: bool = True,
         include_level: bool = True,
     ) -> None:
+        should_auto_scroll = self._console_should_auto_scroll()
         timestamp = datetime.now().strftime("%H:%M:%S")
         colors = self._console_log_colors()
         default_format = QTextCharFormat()
@@ -1848,10 +1948,10 @@ class MainWindow(QMainWindow):
             if include_level:
                 cursor.insertText(f"[{level}] ", level_format)
 
-        if message.startswith("#### "):
-            cursor.insertText("#### ", timestamp_format)
+        if message.startswith("###### "):
+            cursor.insertText("###### ", timestamp_format)
             cursor.insertText(
-                message.removeprefix("#### "),
+                message.removeprefix("###### "),
                 message_format if message_color is not None else default_format,
             )
         else:
@@ -1866,8 +1966,23 @@ class MainWindow(QMainWindow):
         if marker_type is not None:
             self.console_marker_rail.add_marker(total_lines - 1, marker_type)
 
+        if should_auto_scroll:
+            scrollbar = self.console.verticalScrollBar()
+            scrollbar.setValue(scrollbar.maximum())
+
+    def _console_should_auto_scroll(self) -> bool:
         scrollbar = self.console.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
+        return scrollbar.value() >= scrollbar.maximum() - 2
+
+    def _scroll_console_to_line(self, line_number: int) -> None:
+        document = self.console.document()
+        block = document.findBlockByNumber(line_number)
+        if not block.isValid():
+            return
+
+        cursor = QTextCursor(block)
+        self.console.setTextCursor(cursor)
+        self.console.centerCursor()
 
     @staticmethod
     def _marker_type_for_log(

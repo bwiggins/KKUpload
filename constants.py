@@ -11,7 +11,6 @@ SUPPORTED_EXTENSIONS: Final[set[str]] = {
     ".png",
     ".webp",
     ".gif",
-    ".bmp",
     ".tif",
     ".tiff",
 }
