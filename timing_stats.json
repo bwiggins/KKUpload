@@ -1,0 +1,12 @@
+{
+  "samples": [
+    {
+      "completed_at": "2026-07-15T04:15:35.327844+00:00",
+      "file_count": 28,
+      "source_bytes": 6023020,
+      "uploaded_bytes": 6023020,
+      "upload_seconds": 30.811999999452382,
+      "total_seconds": 162.06300000008196
+    }
+  ]
+}

@@ -3,7 +3,13 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
-from list_planner import ListIndex, ListRecord, build_upload_plan, format_list_path
+from list_planner import (
+    ListIndex,
+    ListRecord,
+    build_upload_plan,
+    format_list_path,
+    parse_list_path,
+)
 from scanner import ScannedFile
 
 
@@ -85,6 +91,39 @@ class ListPlannerTests(unittest.TestCase):
             plan.planned_files[1].destination_path,
             ("IMPORT SORTING", "Models", "Rose"),
         )
+
+    def test_import_to_list_can_be_nested_path(self) -> None:
+        files = (
+            ScannedFile(
+                path=Path("Upload/root.jpg"),
+                relative_path=Path("root.jpg"),
+                folder_parts=(),
+            ),
+        )
+
+        plan = build_upload_plan(
+            files,
+            import_to_root=False,
+            root_list="zOther / $ KKUpload",
+            top_folder_name="Upload",
+        )
+
+        self.assertEqual(
+            [item.path for item in plan.required_lists],
+            [
+                ("zOther",),
+                ("zOther", "$ KKUpload"),
+                ("zOther", "$ KKUpload", "Upload"),
+            ],
+        )
+        self.assertEqual(
+            plan.planned_files[0].destination_path,
+            ("zOther", "$ KKUpload", "Upload"),
+        )
+
+    def test_parse_list_path_rejects_empty_parts(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_list_path("zOther//Uploads")
 
     def test_import_to_root_leaves_root_files_unlisted(self) -> None:
         files = (

@@ -42,8 +42,10 @@ from PySide6.QtWidgets import (
 )
 
 from karakeep_client import KarakeepClient
+from list_planner import parse_list_path
 from preferences import AppPreferences, load_preferences
 from scanner import validate_separate_folder_tree
+from timing_stats import default_timing_stats_path
 from upload_worker import MoveConflictRequest, UploadJobConfig, UploadWorker
 
 
@@ -69,6 +71,7 @@ class UploadConfiguration:
     move_conflict_mode: str
     resize_images_if_needed: bool
     auto_generate_output_folders: bool
+    ignore_subfolders: bool
     no_import_tags: bool
     omit_top_folder_list: bool
     import_to_root: bool
@@ -350,7 +353,7 @@ class UploadDialog(QDialog):
         self._manual_unsupported_folder = self.unsupported_field.text()
 
         self.resize_images_if_needed_checkbox = QCheckBox(
-            "Allow image resizing"
+            "Allow img resize"
         )
         self.resize_images_if_needed_checkbox.setChecked(
             self.settings.value(
@@ -380,7 +383,7 @@ class UploadDialog(QDialog):
             self._update_generated_output_folders
         )
 
-        self.omit_top_folder_list_checkbox = QCheckBox("Omit top folder list")
+        self.omit_top_folder_list_checkbox = QCheckBox("Omit top folder")
         self.omit_top_folder_list_checkbox.setChecked(
             self.settings.value(
                 "upload/omit_top_folder_list",
@@ -389,7 +392,19 @@ class UploadDialog(QDialog):
             )
         )
 
-        self.dont_move_completed_checkbox = QCheckBox("Don't move completed")
+        self.ignore_subfolders_checkbox = QCheckBox("Ignore subfolders")
+        self.ignore_subfolders_checkbox.setChecked(
+            self.settings.value(
+                "upload/ignore_subfolders",
+                False,
+                type=bool,
+            )
+        )
+        self.ignore_subfolders_checkbox.toggled.connect(
+            self._update_ignore_subfolders_state
+        )
+
+        self.dont_move_completed_checkbox = QCheckBox("Don't move")
         self.dont_move_completed_checkbox.setChecked(
             self.settings.value(
                 "upload/dont_move_completed",
@@ -401,7 +416,7 @@ class UploadDialog(QDialog):
             self._update_move_folder_state
         )
 
-        self.dont_move_failed_checkbox = QCheckBox("Don't move failed")
+        self.dont_move_failed_checkbox = QCheckBox("Don't move")
         self.dont_move_failed_checkbox.setChecked(
             self.settings.value(
                 "upload/dont_move_failed",
@@ -413,7 +428,7 @@ class UploadDialog(QDialog):
             self._update_move_folder_state
         )
 
-        self.dont_move_unsupported_checkbox = QCheckBox("Don't move unsupported")
+        self.dont_move_unsupported_checkbox = QCheckBox("Don't move")
         self.dont_move_unsupported_checkbox.setChecked(
             self.settings.value(
                 "upload/dont_move_unsupported",
@@ -499,9 +514,15 @@ class UploadDialog(QDialog):
         self.dry_run_checkbox = QCheckBox("Dry-run")
         self.dry_run_checkbox.setChecked(True)
 
+        import_to_list_label = QLabel(
+            "Import to list:<br><span style='font-size: 8pt; font-style: italic;'>"
+            "&nbsp;( / for sublists)</span>"
+        )
+        import_to_list_label.setTextFormat(Qt.TextFormat.RichText)
+
         default_tags_label = QLabel(
-            "Default tags:<br><span style='font-size: 9pt; font-style: italic;'>"
-            "(comma separated)</span>"
+            "Default tags:<br><span style='font-size: 8pt; font-style: italic;'>"
+            "&nbsp;(comma separated)</span>"
         )
         default_tags_label.setTextFormat(Qt.TextFormat.RichText)
 
@@ -529,6 +550,7 @@ class UploadDialog(QDialog):
         upload_options_layout.addWidget(self.resize_images_if_needed_checkbox)
         upload_options_layout.addWidget(self.auto_generate_output_folders_checkbox)
         upload_options_layout.addWidget(self.omit_top_folder_list_checkbox)
+        upload_options_layout.addWidget(self.ignore_subfolders_checkbox)
         upload_options_layout.addStretch(1)
 
         form_layout.addRow("Folder to upload:", self.upload_field)
@@ -552,7 +574,10 @@ class UploadDialog(QDialog):
 
         form_layout.addRow(QLabel(" "))
         form_layout.addRow(self._section_label("New import organization"))
-        form_layout.addRow("Import to list:", root_list_layout)
+        form_layout.addRow(
+            import_to_list_label,
+            root_list_layout,
+        )
         form_layout.addRow(
             default_tags_label,
             tags_layout,
@@ -592,6 +617,9 @@ class UploadDialog(QDialog):
         )
         self._update_generated_output_folders()
         self._update_move_folder_state()
+        self._update_ignore_subfolders_state(
+            self.ignore_subfolders_checkbox.isChecked()
+        )
         self._update_tags_state(self.no_import_tags_checkbox.isChecked())
 
     def _update_root_list_state(self, import_to_root: bool) -> None:
@@ -627,6 +655,14 @@ class UploadDialog(QDialog):
             not self.dont_move_unsupported_checkbox.isChecked()
             and not auto_generate
         )
+        self._update_ignore_subfolders_state(
+            self.ignore_subfolders_checkbox.isChecked()
+        )
+
+    def _update_ignore_subfolders_state(self, ignore_subfolders: bool) -> None:
+        self.dont_preserve_move_structure_checkbox.setEnabled(
+            not ignore_subfolders
+        )
 
     def _update_generated_output_folders(self) -> None:
         if not self.auto_generate_output_folders_checkbox.isChecked():
@@ -647,7 +683,7 @@ class UploadDialog(QDialog):
             str(self._generated_output_folder(upload_folder, "FAIL"))
         )
         self.unsupported_field.set_text(
-            str(self._generated_output_folder(upload_folder, "UNSUP"))
+            str(self._generated_output_folder(upload_folder, "UNSUPPORTED"))
         )
 
     def _update_tags_state(self, no_import_tags: bool) -> None:
@@ -661,6 +697,13 @@ class UploadDialog(QDialog):
     def _section_label(text: str) -> QLabel:
         label = QLabel(f"<b>{text}</b>")
         label.setTextFormat(Qt.TextFormat.RichText)
+        return label
+
+    @staticmethod
+    def _helper_label(text: str) -> QLabel:
+        label = QLabel(text)
+        label.setWordWrap(True)
+        label.setStyleSheet("color: palette(text); opacity: 0.72;")
         return label
 
     def _update_start_button_text(self, dry_run: bool) -> None:
@@ -689,6 +732,7 @@ class UploadDialog(QDialog):
         auto_generate_output_folders = (
             self.auto_generate_output_folders_checkbox.isChecked()
         )
+        ignore_subfolders = self.ignore_subfolders_checkbox.isChecked()
         no_import_tags = self.no_import_tags_checkbox.isChecked()
         omit_top_folder_list = self.omit_top_folder_list_checkbox.isChecked()
 
@@ -758,6 +802,13 @@ class UploadDialog(QDialog):
             )
             return
 
+        if not import_to_root:
+            try:
+                parse_list_path(root_list)
+            except ValueError as exc:
+                self._show_error(str(exc))
+                return
+
         try:
             resolved_upload = upload_folder.resolve()
             resolved_paths = {"Upload": resolved_upload}
@@ -782,19 +833,6 @@ class UploadDialog(QDialog):
             )
         except ValueError as exc:
             self._show_error(str(exc))
-            return
-
-        try:
-            if completed_folder is not None:
-                completed_folder.mkdir(parents=True, exist_ok=True)
-            if error_folder is not None:
-                error_folder.mkdir(parents=True, exist_ok=True)
-            if unsupported_folder is not None:
-                unsupported_folder.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            self._show_error(
-                f"Unable to create a destination folder:\n\n{exc}"
-            )
             return
 
         tags = (
@@ -831,6 +869,7 @@ class UploadDialog(QDialog):
             move_conflict_mode=move_conflict_mode,
             resize_images_if_needed=resize_images_if_needed,
             auto_generate_output_folders=auto_generate_output_folders,
+            ignore_subfolders=ignore_subfolders,
             no_import_tags=no_import_tags,
             omit_top_folder_list=omit_top_folder_list,
             import_to_root=import_to_root,
@@ -885,6 +924,10 @@ class UploadDialog(QDialog):
         self.settings.setValue(
             "upload/auto_generate_output_folders",
             self.auto_generate_output_folders_checkbox.isChecked(),
+        )
+        self.settings.setValue(
+            "upload/ignore_subfolders",
+            self.ignore_subfolders_checkbox.isChecked(),
         )
         self.settings.setValue(
             "upload/no_import_tags",
@@ -1123,6 +1166,8 @@ class LogMarkerRail(QWidget):
         self._markers: list[tuple[int, str]] = []
         self._total_lines = 1
         self._visible_lines = 1
+        self._scrollbar_maximum = 1
+        self._marker_scroll_positions: dict[int, float] = {}
         self.setMinimumWidth(12)
         self.setMaximumWidth(12)
         self.setSizePolicy(
@@ -1137,6 +1182,8 @@ class LogMarkerRail(QWidget):
         self._markers.clear()
         self._total_lines = 1
         self._visible_lines = 1
+        self._scrollbar_maximum = 1
+        self._marker_scroll_positions.clear()
         self.update()
 
     def set_line_metrics(self, total_lines: int, visible_lines: int) -> None:
@@ -1144,9 +1191,21 @@ class LogMarkerRail(QWidget):
         self._visible_lines = max(visible_lines, 1)
         self.update()
 
+    def set_scroll_metrics(
+        self,
+        scrollbar_maximum: int,
+        marker_scroll_positions: dict[int, float],
+    ) -> None:
+        self._scrollbar_maximum = max(scrollbar_maximum, 1)
+        self._marker_scroll_positions = marker_scroll_positions
+        self.update()
+
     def add_marker(self, line_number: int, marker_type: str) -> None:
         self._markers.append((max(line_number, 0), marker_type))
         self.update()
+
+    def markers(self) -> tuple[tuple[int, str], ...]:
+        return tuple(self._markers)
 
     def paintEvent(self, event) -> None:  # noqa: N802
         super().paintEvent(event)
@@ -1207,6 +1266,15 @@ class LogMarkerRail(QWidget):
         top_inset = 16
         bottom_inset = 22
         usable_height = max(self.height() - top_inset - bottom_inset - 1, 1)
+        if line_number in self._marker_scroll_positions:
+            scroll_position = min(
+                max(self._marker_scroll_positions[line_number], 0),
+                self._scrollbar_maximum,
+            )
+            return top_inset + int(
+                (scroll_position / self._scrollbar_maximum) * usable_height
+            )
+
         denominator = max(self._total_lines - self._visible_lines, 1)
         half_viewport = self._visible_lines / 2
         scroll_position = min(
@@ -1277,6 +1345,7 @@ class MainWindow(QMainWindow):
         self.worker: UploadWorker | None = None
         self.pending_log_entries: deque[tuple[str, str, str | None]] = deque()
         self.pending_finish_stopped: bool | None = None
+        self.pending_dry_run_estimate_lines: list[tuple[str, str, str | None]] = []
         self.log_flush_timer = QTimer(self)
         self.log_flush_timer.setInterval(5)
         self.log_flush_timer.timeout.connect(self._flush_pending_logs)
@@ -1489,6 +1558,7 @@ class MainWindow(QMainWindow):
         self.resolved_conflict_count = 0
         self.unsupported_count = 0
         self.failed_files = []
+        self.pending_dry_run_estimate_lines = []
         self.completed_operations = 0
         self.total_operations = 0
         self.total_files = 0
@@ -1502,6 +1572,7 @@ class MainWindow(QMainWindow):
         self.pause_button.setEnabled(True)
         self.pause_button.setText("Pause")
         self.stop_button.setEnabled(True)
+        self.clear_console_button.setEnabled(False)
 
         self.progress_bar.setRange(0, 0)
         self.progress_bar.setValue(0)
@@ -1518,7 +1589,8 @@ class MainWindow(QMainWindow):
             )
         else:
             self._log(
-                f"Created completed folder: {config.completed_folder}"
+                "Completed folder will be created when needed: "
+                f"{config.completed_folder}"
             )
 
         if config.dont_move_failed:
@@ -1526,7 +1598,9 @@ class MainWindow(QMainWindow):
         elif config.error_folder is not None and config.error_folder.exists():
             self._log(f"Found error folder: {config.error_folder}")
         else:
-            self._log(f"Created error folder: {config.error_folder}")
+            self._log(
+                f"Error folder will be created when needed: {config.error_folder}"
+            )
 
         if config.dont_move_unsupported:
             self._log("Unsupported files will not be moved.")
@@ -1536,12 +1610,20 @@ class MainWindow(QMainWindow):
         ):
             self._log(f"Found unsupported folder: {config.unsupported_folder}")
         else:
-            self._log(f"Created unsupported folder: {config.unsupported_folder}")
+            self._log(
+                "Unsupported folder will be created when needed: "
+                f"{config.unsupported_folder}"
+            )
 
         if config.dont_preserve_move_structure:
             self._log("Move mode: drop files directly into output folders.")
         else:
             self._log("Move mode: preserve relative folder structure.")
+
+        if config.ignore_subfolders:
+            self._log("Subfolder mode: ignore child folders.")
+        else:
+            self._log("Subfolder mode: include child folders.")
 
         conflict_labels = {
             "ask": "ask before continuing",
@@ -1588,12 +1670,14 @@ class MainWindow(QMainWindow):
             dont_preserve_move_structure=config.dont_preserve_move_structure,
             move_conflict_mode=config.move_conflict_mode,
             resize_images_if_needed=config.resize_images_if_needed,
+            ignore_subfolders=config.ignore_subfolders,
             import_to_root=config.import_to_root,
             root_list=config.root_list,
             default_tags=config.default_tags,
             dry_run=config.dry_run,
             omit_top_folder_list=config.omit_top_folder_list,
             image_resize_preferences=self.preferences.image_resize,
+            timing_stats_path=default_timing_stats_path(Path(__file__)),
         )
 
         self.worker_thread = QThread(self)
@@ -1635,9 +1719,21 @@ class MainWindow(QMainWindow):
         message_color: object,
     ) -> None:
         color = message_color if isinstance(message_color, str) else None
+        if self._should_hold_dry_run_estimate_line(message):
+            self.pending_dry_run_estimate_lines.append((message, level, color))
+            return
+
         self.pending_log_entries.append((message, level, color))
         if not self.log_flush_timer.isActive():
             self.log_flush_timer.start()
+
+    def _should_hold_dry_run_estimate_line(self, message: str) -> bool:
+        if self.configuration is None or not self.configuration.dry_run:
+            return False
+
+        return message.startswith(
+            "Estimated non-dry-run batch time:"
+        ) or message.startswith("Estimate details:")
 
     def _handle_failed_file(self, relative_path: str, reason: str) -> None:
         self.failed_files.append((relative_path, reason))
@@ -1711,6 +1807,7 @@ class MainWindow(QMainWindow):
 
     def _clear_console(self) -> None:
         self.pending_log_entries.clear()
+        self.pending_dry_run_estimate_lines.clear()
         self.log_flush_timer.stop()
         self.console.clear()
         self.console_marker_rail.clear_markers()
@@ -1760,6 +1857,7 @@ class MainWindow(QMainWindow):
             )
 
         eta_text = self._format_eta()
+        eta_color = colors["timestamp"]
 
         self.summary_label.setText(
             f"Succeeded: {self.succeeded_count}&nbsp;&nbsp;&nbsp;&nbsp;"
@@ -1768,7 +1866,7 @@ class MainWindow(QMainWindow):
             "&nbsp;&nbsp;&nbsp;&nbsp;"
             f"Unsupported: {self._format_unsupported_count()}&nbsp;&nbsp;&nbsp;&nbsp;"
             f"Remaining: {remaining}&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"
-            f"ETA: {eta_text}"
+            f"<span style='color: {eta_color};'>ETA: {eta_text}</span>"
         )
 
     def _format_eta(self) -> str:
@@ -1801,6 +1899,13 @@ class MainWindow(QMainWindow):
             return f"{hours:d}:{minutes:02d}:{seconds:02d}"
         return f"{minutes:02d}:{seconds:02d}"
 
+    def _format_total_elapsed_time(self) -> str:
+        if self.job_started_at is None:
+            return "--"
+
+        elapsed_seconds = int(round(max(time.monotonic() - self.job_started_at, 0)))
+        return self._format_duration(elapsed_seconds)
+
     def _format_unsupported_count(self) -> str:
         return self._format_warning_count(self.unsupported_count)
 
@@ -1828,6 +1933,11 @@ class MainWindow(QMainWindow):
             )
         else:
             self._log(f"Failed: {self.failed_count} / {total}")
+
+        if self.pending_dry_run_estimate_lines:
+            for message, level, color in self.pending_dry_run_estimate_lines:
+                self._log(message, level=level, message_color=color)
+            self.pending_dry_run_estimate_lines.clear()
 
         if include_not_processed:
             self._log(
@@ -1895,7 +2005,9 @@ class MainWindow(QMainWindow):
                 level="WARNING",
                 message_color="WARNING",
             )
+            self._log(f"Total time: {self._format_total_elapsed_time()}")
             self._log_completion_summary(include_not_processed=True)
+            self.clear_console_button.setEnabled(True)
         else:
             self.current_file_label.setText("Current file: complete")
             complete_message = (
@@ -1908,7 +2020,9 @@ class MainWindow(QMainWindow):
                 level="SUCCESS",
                 message_color="SUCCESS",
             )
+            self._log(f"Total time: {self._format_total_elapsed_time()}")
             self._log_completion_summary()
+            self.clear_console_button.setEnabled(True)
 
     def _log(
         self,
@@ -1965,6 +2079,7 @@ class MainWindow(QMainWindow):
         marker_type = self._marker_type_for_log(message, level, message_color)
         if marker_type is not None:
             self.console_marker_rail.add_marker(total_lines - 1, marker_type)
+            self._update_console_marker_metrics()
 
         if should_auto_scroll:
             scrollbar = self.console.verticalScrollBar()
@@ -2016,6 +2131,31 @@ class MainWindow(QMainWindow):
             self.console.document().blockCount(),
             self._visible_console_lines(),
         )
+        self.console_marker_rail.set_scroll_metrics(
+            self.console.verticalScrollBar().maximum(),
+            self._console_marker_scroll_positions(),
+        )
+
+    def _console_marker_scroll_positions(self) -> dict[int, float]:
+        document = self.console.document()
+        layout = document.documentLayout()
+        viewport_height = self.console.viewport().height()
+        scrollbar_maximum = self.console.verticalScrollBar().maximum()
+        positions: dict[int, float] = {}
+
+        for line_number, _marker_type in self.console_marker_rail.markers():
+            block = document.findBlockByNumber(line_number)
+            if not block.isValid():
+                continue
+
+            block_rect = layout.blockBoundingRect(block)
+            target_scroll = block_rect.center().y() - (viewport_height / 2)
+            positions[line_number] = min(
+                max(target_scroll, 0.0),
+                float(scrollbar_maximum),
+            )
+
+        return positions
 
     def _console_log_colors(self) -> dict[str, str]:
         base_color = self.console.palette().base().color()

@@ -8,6 +8,7 @@ import httpx
 from list_planner import ListRecord
 from preferences import ImageResizePreferences
 from PySide6.QtGui import QImage
+from timing_stats import new_upload_timing_sample, record_upload_timing
 from upload_worker import UploadJobConfig, UploadWorker
 
 
@@ -363,6 +364,55 @@ class UploadWorkerTests(unittest.TestCase):
             self.assertTrue((completed_folder / "alpha.jpg").exists())
             self.assertFalse((upload_folder / "beta.jpg").exists())
             self.assertTrue((completed_folder / "beta.jpg").exists())
+
+    def test_worker_can_ignore_subfolders(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            upload_folder = root / "upload"
+            nested_folder = upload_folder / "Nested"
+            completed_folder = root / "completed"
+            unsupported_folder = root / "unsupported"
+            nested_folder.mkdir(parents=True)
+            (upload_folder / "root.jpg").write_text("x")
+            (upload_folder / "root.txt").write_text("x")
+            (nested_folder / "nested.jpg").write_text("x")
+            (nested_folder / "nested.txt").write_text("x")
+
+            client = SuccessfulUploadClient()
+            worker = UploadWorker(
+                UploadJobConfig(
+                    server_url="https://karakeep.example.test",
+                    api_key="token",
+                    upload_folder=upload_folder,
+                    completed_folder=completed_folder,
+                    error_folder=root / "errors",
+                    unsupported_folder=unsupported_folder,
+                    dont_move_completed=False,
+                    dont_move_failed=False,
+                    dont_move_unsupported=False,
+                    dont_preserve_move_structure=False,
+                    move_conflict_mode="ask",
+                    import_to_root=False,
+                    root_list="IMPORT SORTING",
+                    default_tags=(),
+                    dry_run=False,
+                    ignore_subfolders=True,
+                ),
+                client=client,
+            )
+
+            worker.run()
+
+            self.assertEqual(
+                client.uploaded_files,
+                [(upload_folder / "root.jpg").resolve()],
+            )
+            self.assertFalse((upload_folder / "root.jpg").exists())
+            self.assertTrue((completed_folder / "root.jpg").exists())
+            self.assertFalse((upload_folder / "root.txt").exists())
+            self.assertTrue((unsupported_folder / "root.txt").exists())
+            self.assertTrue((nested_folder / "nested.jpg").exists())
+            self.assertTrue((nested_folder / "nested.txt").exists())
 
     def test_worker_can_omit_top_folder_list(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -817,6 +867,151 @@ class UploadWorkerTests(unittest.TestCase):
             self.assertIn(
                 f"Dry-run: would move unsupported file to: {unsupported_folder / 'poop.txt'}",
                 "\n".join(log_messages),
+            )
+
+    def test_dry_run_reports_estimated_non_dry_run_batch_time(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            upload_folder = root / "upload"
+            stats_path = root / "timing_stats.json"
+            upload_folder.mkdir()
+            (upload_folder / "image.jpg").write_bytes(b"x" * 1000)
+            record_upload_timing(
+                stats_path,
+                new_upload_timing_sample(
+                    file_count=1,
+                    source_bytes=1000,
+                    uploaded_bytes=1000,
+                    upload_seconds=10,
+                    total_seconds=12,
+                ),
+            )
+
+            worker = UploadWorker(
+                UploadJobConfig(
+                    server_url="https://karakeep.example.test",
+                    api_key="token",
+                    upload_folder=upload_folder,
+                    completed_folder=root / "completed",
+                    error_folder=root / "errors",
+                    dont_move_completed=False,
+                    dont_move_failed=False,
+                    dont_preserve_move_structure=False,
+                    move_conflict_mode="ask",
+                    import_to_root=False,
+                    root_list="IMPORT SORTING",
+                    default_tags=(),
+                    dry_run=True,
+                    timing_stats_path=stats_path,
+                ),
+                client=EmptyDryRunClient(),
+            )
+
+            log_messages: list[str] = []
+            worker.log.connect(
+                lambda message, level, message_color: log_messages.append(message)
+            )
+
+            worker.run()
+
+            joined_logs = "\n".join(log_messages)
+            self.assertIn(
+                "Estimated non-dry-run batch time: about",
+                joined_logs,
+            )
+            self.assertIn("Estimate details: based on 1 previous run", joined_logs)
+
+    def test_dry_run_reports_unknown_eta_without_previous_timing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            upload_folder = root / "upload"
+            stats_path = root / "missing_timing_stats.json"
+            upload_folder.mkdir()
+            (upload_folder / "image.jpg").write_bytes(b"x" * 1000)
+
+            worker = UploadWorker(
+                UploadJobConfig(
+                    server_url="https://karakeep.example.test",
+                    api_key="token",
+                    upload_folder=upload_folder,
+                    completed_folder=root / "completed",
+                    error_folder=root / "errors",
+                    dont_move_completed=False,
+                    dont_move_failed=False,
+                    dont_preserve_move_structure=False,
+                    move_conflict_mode="ask",
+                    import_to_root=False,
+                    root_list="IMPORT SORTING",
+                    default_tags=(),
+                    dry_run=True,
+                    timing_stats_path=stats_path,
+                ),
+                client=EmptyDryRunClient(),
+            )
+
+            log_messages: list[str] = []
+            worker.log.connect(
+                lambda message, level, message_color: log_messages.append(message)
+            )
+
+            worker.run()
+
+            joined_logs = "\n".join(log_messages)
+            self.assertIn(
+                "Estimated non-dry-run batch time: unknown; "
+                "no previous upload timing data.",
+                joined_logs,
+            )
+
+    def test_live_upload_reports_initial_non_dry_run_batch_eta(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            upload_folder = root / "upload"
+            stats_path = root / "timing_stats.json"
+            upload_folder.mkdir()
+            (upload_folder / "image.jpg").write_bytes(b"x" * 1000)
+            record_upload_timing(
+                stats_path,
+                new_upload_timing_sample(
+                    file_count=1,
+                    source_bytes=1000,
+                    uploaded_bytes=1000,
+                    upload_seconds=10,
+                    total_seconds=12,
+                ),
+            )
+
+            worker = UploadWorker(
+                UploadJobConfig(
+                    server_url="https://karakeep.example.test",
+                    api_key="token",
+                    upload_folder=upload_folder,
+                    completed_folder=root / "completed",
+                    error_folder=root / "errors",
+                    dont_move_completed=True,
+                    dont_move_failed=True,
+                    dont_preserve_move_structure=False,
+                    move_conflict_mode="ask",
+                    import_to_root=False,
+                    root_list="IMPORT SORTING",
+                    default_tags=(),
+                    dry_run=False,
+                    timing_stats_path=stats_path,
+                ),
+                client=SuccessfulUploadClient(),
+            )
+
+            log_messages: list[str] = []
+            worker.log.connect(
+                lambda message, level, message_color: log_messages.append(message)
+            )
+
+            worker.run()
+
+            joined_logs = "\n".join(log_messages)
+            self.assertIn(
+                "Estimated non-dry-run batch time: about",
+                joined_logs,
             )
 
     def test_unsupported_asset_type_investigates_failed_file(self) -> None:

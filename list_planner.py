@@ -82,7 +82,7 @@ def build_upload_plan(
     planned_files: list[PlannedFile] = []
 
     if not import_to_root:
-        root_path = (root_list,)
+        root_path = parse_list_path(root_list)
         required_paths.add(root_path)
     else:
         root_path = ()
@@ -130,3 +130,13 @@ def format_list_path(path: tuple[str, ...] | None) -> str:
     if not path:
         return "(Karakeep root / no list)"
     return " / ".join(path)
+
+
+def parse_list_path(value: str) -> tuple[str, ...]:
+    parts = tuple(part.strip() for part in value.split("/"))
+    if not parts or any(not part for part in parts):
+        raise ValueError(
+            "Import to list cannot contain empty path parts. "
+            "Use / only between list names."
+        )
+    return parts

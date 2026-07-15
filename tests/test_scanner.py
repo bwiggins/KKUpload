@@ -38,6 +38,34 @@ class ScannerTests(unittest.TestCase):
                 {"ignore.txt", "karakeep_rejects_bmp.bmp"},
             )
 
+    def test_scan_can_ignore_subfolders(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "root.jpg").write_text("x")
+            (root / "root.txt").write_text("x")
+            (root / "Nested").mkdir()
+            (root / "Nested" / "nested.jpg").write_text("x")
+            (root / "Nested" / "nested.txt").write_text("x")
+
+            result = scan_upload_folder(root, ignore_subfolders=True)
+
+            relative_paths = {
+                str(file.relative_path).replace("\\", "/")
+                for file in result.supported_files
+            }
+            unsupported_paths = {
+                str(path.relative_to(root)).replace("\\", "/")
+                for path in result.unsupported_files
+            }
+            scanned_folders = {
+                str(path.relative_to(root)).replace("\\", "/")
+                for path in result.scanned_folders
+            }
+
+            self.assertEqual(relative_paths, {"root.jpg"})
+            self.assertEqual(unsupported_paths, {"root.txt"})
+            self.assertEqual(scanned_folders, {"."})
+
     def test_rejects_any_nested_folder_relationship(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

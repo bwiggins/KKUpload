@@ -6,6 +6,7 @@ from pathlib import Path
 import shutil
 import tempfile
 import threading
+import time
 from typing import Protocol
 
 import httpx
@@ -23,6 +24,11 @@ from list_planner import (
 )
 from preferences import ImageResizePreferences
 from scanner import scan_upload_folder
+from timing_stats import (
+    estimate_upload_time,
+    new_upload_timing_sample,
+    record_upload_timing,
+)
 
 
 @dataclass(frozen=True)
@@ -40,6 +46,7 @@ class UploadJobConfig:
     root_list: str
     default_tags: tuple[str, ...]
     dry_run: bool
+    ignore_subfolders: bool = False
     unsupported_folder: Path | None = None
     dont_move_unsupported: bool = False
     omit_top_folder_list: bool = False
@@ -47,6 +54,7 @@ class UploadJobConfig:
         default_factory=ImageResizePreferences
     )
     resize_images_if_needed: bool = True
+    timing_stats_path: Path | None = None
 
 
 @dataclass
@@ -136,6 +144,9 @@ class UploadWorker(QObject):
         self._stop_requested = False
         self._paused = False
         self._move_conflict_policy: str | None = None
+        self._run_started_at = 0.0
+        self._uploaded_bytes = 0
+        self._upload_seconds = 0.0
 
     def request_stop(self) -> None:
         self._stop_requested = True
@@ -147,6 +158,9 @@ class UploadWorker(QObject):
         succeeded = 0
         failed = 0
         not_processed = 0
+        self._run_started_at = time.monotonic()
+        self._uploaded_bytes = 0
+        self._upload_seconds = 0.0
 
         try:
             with tempfile.TemporaryDirectory(prefix="kkupload-") as temp_dir:
@@ -166,6 +180,7 @@ class UploadWorker(QObject):
                 )
 
                 total_files = len(plan.planned_files)
+                total_source_bytes = self._total_source_bytes(plan.planned_files)
                 required_lists = plan.required_lists
                 pipeline_operation_count = total_files
 
@@ -235,7 +250,15 @@ class UploadWorker(QObject):
                         return
 
                     succeeded, completed_operations, processed_files = result
+                    self._log_upload_batch_estimate(
+                        file_count=total_files,
+                        source_bytes=total_source_bytes,
+                    )
                 elif plan.planned_files:
+                    self._log_upload_batch_estimate(
+                        file_count=total_files,
+                        source_bytes=total_source_bytes,
+                    )
                     result = self._upload_files(
                         client,
                         list_index,
@@ -264,6 +287,11 @@ class UploadWorker(QObject):
                 else:
                     self._log("No supported files found.")
 
+            if not self.config.dry_run:
+                self._record_upload_timing(
+                    file_count=succeeded + failed,
+                    source_bytes=total_source_bytes,
+                )
             self.finished.emit(False, succeeded, failed, not_processed)
         except Exception as exc:  # noqa: BLE001
             self._log(f"Batch failed: {exc}", level="ERROR", message_color="ERROR")
@@ -272,7 +300,10 @@ class UploadWorker(QObject):
 
     def _scan(self):
         self._log(f"Scanning upload folder: {self.config.upload_folder}")
-        scan_result = scan_upload_folder(self.config.upload_folder)
+        scan_result = scan_upload_folder(
+            self.config.upload_folder,
+            ignore_subfolders=self.config.ignore_subfolders,
+        )
         self._log(f"Found {len(scan_result.supported_files)} supported files.")
         self._log(f"Found {len(scan_result.unsupported_files)} unsupported files.")
         for unsupported_file in scan_result.unsupported_files:
@@ -303,6 +334,117 @@ class UploadWorker(QObject):
                 break
         self.unsupported_found.emit(len(scan_result.unsupported_files))
         return scan_result
+
+    @staticmethod
+    def _total_source_bytes(planned_files) -> int:
+        total = 0
+        for file in planned_files:
+            try:
+                total += file.file_path.stat().st_size
+            except OSError:
+                continue
+        return total
+
+    def _log_upload_batch_estimate(
+        self,
+        *,
+        file_count: int,
+        source_bytes: int,
+    ) -> None:
+        if file_count <= 0:
+            self._log(
+                "Estimated non-dry-run batch time: none; no supported files."
+            )
+            return
+
+        stats_path = self.config.timing_stats_path
+        if stats_path is None:
+            self._log(
+                "Estimated non-dry-run batch time: unknown; "
+                "no previous upload timing data."
+            )
+            return
+
+        estimate = estimate_upload_time(
+            stats_path,
+            file_count=file_count,
+            source_bytes=source_bytes,
+        )
+        if estimate.seconds is None:
+            self._log(
+                "Estimated non-dry-run batch time: unknown; "
+                "no previous upload timing data."
+            )
+            return
+
+        self._log(
+            "Estimated non-dry-run batch time: about "
+            f"{self._format_duration(estimate.seconds)}"
+        )
+
+        if estimate.used_fallback:
+            details: list[str] = [
+                "rough fallback estimate; no previous upload timing data"
+            ]
+        else:
+            details = [f"based on {estimate.sample_count} previous run"]
+            if estimate.sample_count != 1:
+                details[0] += "s"
+        if estimate.upload_bytes_per_second is not None:
+            details.append(
+                f"{self._format_bytes_per_second(estimate.upload_bytes_per_second)}"
+            )
+        if estimate.overhead_seconds_per_file is not None:
+            details.append(
+                f"{estimate.overhead_seconds_per_file:.2f}s/file overhead"
+            )
+
+        self._log("Estimate details: " + ", ".join(details) + ".")
+
+    def _record_upload_timing(self, *, file_count: int, source_bytes: int) -> None:
+        if self.config.timing_stats_path is None or file_count <= 0:
+            return
+
+        total_seconds = time.monotonic() - self._run_started_at
+        sample = new_upload_timing_sample(
+            file_count=file_count,
+            source_bytes=source_bytes,
+            uploaded_bytes=self._uploaded_bytes,
+            upload_seconds=self._upload_seconds,
+            total_seconds=total_seconds,
+        )
+
+        try:
+            record_upload_timing(self.config.timing_stats_path, sample)
+        except OSError as exc:
+            self._log(
+                f"Unable to save upload timing stats: {exc}",
+                level="WARNING",
+                message_color="WARNING",
+            )
+
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        total_seconds = max(int(round(seconds)), 0)
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        if hours:
+            return f"{hours:d}h {minutes:02d}m {seconds:02d}s"
+        if minutes:
+            return f"{minutes:d}m {seconds:02d}s"
+        return f"{seconds:d}s"
+
+    @staticmethod
+    def _format_bytes_per_second(bytes_per_second: float) -> str:
+        units = ("B/s", "KB/s", "MB/s", "GB/s")
+        value = max(float(bytes_per_second), 0.0)
+        unit_index = 0
+        while value >= 1024 and unit_index < len(units) - 1:
+            value /= 1024
+            unit_index += 1
+        if unit_index == 0:
+            return f"{value:.0f} {units[unit_index]}"
+        return f"{value:.1f} {units[unit_index]}"
 
     @staticmethod
     def _format_relative_folder(folder_parts: tuple[str, ...]) -> str:
@@ -631,7 +773,7 @@ class UploadWorker(QObject):
     ) -> dict:
         self._log_uploading_asset(upload_path)
         try:
-            return client.upload_asset(upload_path)
+            return self._timed_upload_asset(client, upload_path)
         except httpx.HTTPStatusError as exc:
             if (
                 not self.config.resize_images_if_needed
@@ -655,7 +797,24 @@ class UploadWorker(QObject):
                 level="WARNING",
             )
             self._log_uploading_asset(resized_path)
-            return client.upload_asset(resized_path)
+            return self._timed_upload_asset(client, resized_path)
+
+    def _timed_upload_asset(
+        self,
+        client: ClientProtocol,
+        file_path: Path,
+    ) -> dict:
+        try:
+            upload_size = file_path.stat().st_size
+        except OSError:
+            upload_size = 0
+
+        started_at = time.monotonic()
+        try:
+            return client.upload_asset(file_path)
+        finally:
+            self._upload_seconds += time.monotonic() - started_at
+            self._uploaded_bytes += upload_size
 
     def _log_uploading_asset(self, file_path: Path) -> None:
         self._log(

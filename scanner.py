@@ -24,13 +24,20 @@ def is_supported_file(path: Path) -> bool:
     return path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS
 
 
-def scan_upload_folder(upload_folder: Path) -> ScanResult:
+def scan_upload_folder(
+    upload_folder: Path,
+    *,
+    ignore_subfolders: bool = False,
+) -> ScanResult:
     upload_folder = upload_folder.resolve()
     scanned_folders: list[Path] = []
     supported_files: list[ScannedFile] = []
     unsupported_files: list[Path] = []
 
-    for current_folder in _walk_folders(upload_folder):
+    for current_folder in _walk_folders(
+        upload_folder,
+        ignore_subfolders=ignore_subfolders,
+    ):
         scanned_folders.append(current_folder)
 
         for child in sorted(current_folder.iterdir(), key=lambda item: item.name.lower()):
@@ -94,11 +101,18 @@ def validate_separate_folder_tree(
                 )
 
 
-def _walk_folders(root: Path) -> tuple[Path, ...]:
+def _walk_folders(
+    root: Path,
+    *,
+    ignore_subfolders: bool = False,
+) -> tuple[Path, ...]:
     folders: list[Path] = []
 
     def visit(folder: Path) -> None:
         folders.append(folder)
+        if ignore_subfolders:
+            return
+
         children = [
             child
             for child in folder.iterdir()
