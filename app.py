@@ -1940,6 +1940,14 @@ class MainWindow(QMainWindow):
             self._log("Upload configuration was not returned.")
             return
 
+        if (
+            not config.dry_run
+            and config.dont_move_completed
+            and not self._confirm_start_with_completed_files_left_in_place()
+        ):
+            self._log("Upload canceled before start.")
+            return
+
         server_url = str(
             self.settings.value("connection/server_url", "") or ""
         ).strip()
@@ -2216,6 +2224,15 @@ class MainWindow(QMainWindow):
         if not self.is_running:
             return
 
+        if (
+            self.configuration is not None
+            and not self.configuration.dry_run
+            and self.configuration.dont_move_completed
+            and not self._confirm_stop_with_completed_files_left_in_place()
+        ):
+            self._log("Stop canceled.")
+            return
+
         self.stop_requested = True
         if self.worker is not None:
             self.worker.request_stop()
@@ -2226,6 +2243,52 @@ class MainWindow(QMainWindow):
             "Stop requested. The batch will stop at "
             "the next safe checkpoint.",
             level="WARNING",
+        )
+
+    def _confirm_start_with_completed_files_left_in_place(self) -> bool:
+        return (
+            QMessageBox.warning(
+                self,
+                "Do Not Stop This Batch Midway",
+                (
+                    "This batch is configured to leave successfully uploaded "
+                    "files in the upload folder.\n\n"
+                    "That is usually fine if the batch runs to completion. "
+                    "However, if you stop it before it finishes and later run "
+                    "the same folder again, KKUpload cannot reliably tell "
+                    "which files were already uploaded. The next run may "
+                    "create duplicate uploads.\n\n"
+                    "Only start this upload if you intend to let it finish, "
+                    "or if you are comfortable handling duplicates yourself.\n\n"
+                    "Start this upload anyway?"
+                ),
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            == QMessageBox.StandardButton.Yes
+        )
+
+    def _confirm_stop_with_completed_files_left_in_place(self) -> bool:
+        return (
+            QMessageBox.warning(
+                self,
+                "Stopping Can Cause Duplicate Uploads Later",
+                (
+                    "This batch is leaving successfully uploaded files in the "
+                    "upload folder.\n\n"
+                    "Stopping before the batch finishes is unsafe because a "
+                    "later run of this same folder may scan those successful "
+                    "files again. KKUpload cannot reliably tell which files "
+                    "were already uploaded, so the next run may create "
+                    "duplicates.\n\n"
+                    "Stop this upload anyway?"
+                ),
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            == QMessageBox.StandardButton.Yes
         )
 
     def _clear_console(self) -> None:
