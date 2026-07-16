@@ -5,7 +5,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from preferences import load_preferences, preferences_path
+from preferences import (
+    AppPreferences,
+    ImageResizePreferences,
+    load_preferences,
+    preferences_path,
+    save_preferences,
+)
 
 
 class PreferencesTests(unittest.TestCase):
@@ -58,6 +64,40 @@ class PreferencesTests(unittest.TestCase):
                     "Rewrote preferences file" in message
                     for message, _ in result.messages
                 )
+            )
+
+    def test_save_preferences_writes_json_values(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app_path = Path(temp_dir) / "app.py"
+            preferences = AppPreferences(
+                image_resize=ImageResizePreferences(
+                    maximum_allowed_image_size_mb=80.0,
+                    desired_resize_goal_mb=32.5,
+                    maximum_attempts=6,
+                    acceptable_distance_percent=7.5,
+                    fail_if_not_within_goal=True,
+                )
+            )
+
+            path = save_preferences(app_path, preferences)
+            saved = json.loads(path.read_text(encoding="utf-8"))
+
+            self.assertEqual(
+                saved["image_resize"]["maximum_allowed_image_size_mb"],
+                80.0,
+            )
+            self.assertEqual(
+                saved["image_resize"]["desired_resize_goal_mb"],
+                32.5,
+            )
+            self.assertEqual(saved["image_resize"]["maximum_attempts"], 6)
+            self.assertEqual(
+                saved["image_resize"]["acceptable_distance_percent"],
+                7.5,
+            )
+            self.assertIs(
+                saved["image_resize"]["fail_if_not_within_goal"],
+                True,
             )
 
 

@@ -51,6 +51,12 @@ def preferences_path(app_path: Path) -> Path:
     return app_path.with_name(PREFERENCES_FILE_NAME)
 
 
+def save_preferences(app_path: Path, preferences: AppPreferences) -> Path:
+    path = preferences_path(app_path)
+    _write_preferences(path, preferences)
+    return path
+
+
 def load_preferences(app_path: Path) -> PreferenceLoadResult:
     path = preferences_path(app_path)
     defaults = default_preferences()

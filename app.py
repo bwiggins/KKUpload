@@ -28,8 +28,10 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -39,6 +41,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSizePolicy,
+    QSpinBox,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -46,7 +49,12 @@ from PySide6.QtWidgets import (
 
 from karakeep_client import KarakeepClient
 from list_planner import parse_list_path
-from preferences import AppPreferences, load_preferences
+from preferences import (
+    AppPreferences,
+    ImageResizePreferences,
+    load_preferences,
+    save_preferences,
+)
 from scanner import validate_separate_folder_tree
 from timing_stats import default_timing_stats_path
 from upload_worker import MoveConflictRequest, UploadJobConfig, UploadWorker
@@ -309,6 +317,127 @@ class ConnectionSettingsDialog(QDialog):
             "Invalid Connection Settings",
             message,
         )
+
+
+class PreferencesDialog(QDialog):
+    """Edits JSON-backed application preferences."""
+
+    def __init__(
+        self,
+        preferences: AppPreferences,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+
+        self.preferences = preferences
+
+        self.setWindowTitle("Preferences")
+        self.setModal(True)
+        self.setMinimumWidth(460)
+
+        image_resize = preferences.image_resize
+
+        self.maximum_allowed_size_spin = QDoubleSpinBox()
+        self.maximum_allowed_size_spin.setRange(0.1, 100000.0)
+        self.maximum_allowed_size_spin.setDecimals(1)
+        self.maximum_allowed_size_spin.setSuffix(" MB")
+        self.maximum_allowed_size_spin.setValue(
+            image_resize.maximum_allowed_image_size_mb
+        )
+
+        self.desired_goal_spin = QDoubleSpinBox()
+        self.desired_goal_spin.setRange(0.1, 100000.0)
+        self.desired_goal_spin.setDecimals(1)
+        self.desired_goal_spin.setSuffix(" MB")
+        self.desired_goal_spin.setValue(
+            image_resize.desired_resize_goal_mb
+        )
+
+        self.maximum_attempts_spin = QSpinBox()
+        self.maximum_attempts_spin.setRange(1, 100)
+        self.maximum_attempts_spin.setValue(image_resize.maximum_attempts)
+
+        self.acceptable_distance_spin = QDoubleSpinBox()
+        self.acceptable_distance_spin.setRange(0.1, 99.9)
+        self.acceptable_distance_spin.setDecimals(1)
+        self.acceptable_distance_spin.setSuffix("%")
+        self.acceptable_distance_spin.setValue(
+            image_resize.acceptable_distance_percent
+        )
+
+        self.fail_if_not_within_goal_checkbox = QCheckBox(
+            "Fail if resized image is not within goal range"
+        )
+        self.fail_if_not_within_goal_checkbox.setChecked(
+            image_resize.fail_if_not_within_goal
+        )
+
+        resize_form = QFormLayout()
+        resize_form.setFieldGrowthPolicy(
+            QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow
+        )
+        resize_form.addRow(
+            "Maximum allowed image size:",
+            self.maximum_allowed_size_spin,
+        )
+        resize_form.addRow("Desired resize goal:", self.desired_goal_spin)
+        resize_form.addRow("Maximum resize attempts:", self.maximum_attempts_spin)
+        resize_form.addRow(
+            "Acceptable distance from goal:",
+            self.acceptable_distance_spin,
+        )
+        resize_form.addRow("", self.fail_if_not_within_goal_checkbox)
+
+        resize_group = QGroupBox("Image resizing")
+        resize_group.setLayout(resize_form)
+
+        helper_text = QLabel(
+            "Images larger than the maximum allowed size, or rejected by "
+            "Karakeep as too large, can be resized toward the desired goal."
+        )
+        helper_text.setWordWrap(True)
+
+        self.button_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Cancel
+            | QDialogButtonBox.StandardButton.Save
+        )
+        self.button_box.accepted.connect(self._validate_and_accept)
+        self.button_box.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(resize_group)
+        layout.addWidget(helper_text)
+        layout.addWidget(self.button_box)
+
+    def _validate_and_accept(self) -> None:
+        maximum_allowed = self.maximum_allowed_size_spin.value()
+        desired_goal = self.desired_goal_spin.value()
+
+        if desired_goal >= maximum_allowed:
+            QMessageBox.critical(
+                self,
+                "Invalid Preferences",
+                (
+                    "Desired resize goal must be lower than the maximum "
+                    "allowed image size."
+                ),
+            )
+            return
+
+        self.preferences = AppPreferences(
+            image_resize=ImageResizePreferences(
+                maximum_allowed_image_size_mb=maximum_allowed,
+                desired_resize_goal_mb=desired_goal,
+                maximum_attempts=self.maximum_attempts_spin.value(),
+                acceptable_distance_percent=(
+                    self.acceptable_distance_spin.value()
+                ),
+                fail_if_not_within_goal=(
+                    self.fail_if_not_within_goal_checkbox.isChecked()
+                ),
+            )
+        )
+        self.accept()
 
 
 class UploadDialog(QDialog):
@@ -1477,9 +1606,7 @@ class MainWindow(QMainWindow):
 
         edit_menu = self.menuBar().addMenu("&Edit")
         preferences_action = QAction("Preferences", self)
-        preferences_action.triggered.connect(
-            lambda: self._show_not_implemented("Preferences")
-        )
+        preferences_action.triggered.connect(self._open_preferences)
         edit_menu.addAction(preferences_action)
 
         search_menu = self.menuBar().addMenu("&Search")
@@ -1552,6 +1679,28 @@ class MainWindow(QMainWindow):
         shortcut_action.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
         shortcut_action.triggered.connect(navigate)
         self.addAction(shortcut_action)
+
+    def _open_preferences(self) -> bool:
+        dialog = PreferencesDialog(self.preferences, self)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            self._log("Preferences canceled.")
+            return False
+
+        try:
+            path = save_preferences(Path(__file__), dialog.preferences)
+        except OSError as exc:
+            QMessageBox.critical(
+                self,
+                "Unable to Save Preferences",
+                f"Could not save preferences:\n\n{exc}",
+            )
+            self._log(f"Unable to save preferences: {exc}", level="ERROR")
+            return False
+
+        self.preferences = dialog.preferences
+        self._log(f"Preferences saved: {path}", level="SUCCESS")
+        return True
 
     def _open_connection_settings(self) -> bool:
         dialog = ConnectionSettingsDialog(
