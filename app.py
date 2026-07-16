@@ -12,6 +12,7 @@ from typing import Final
 import keyring
 from PySide6.QtCore import QSettings, QSize, QThread, QTimer, Qt, Signal
 from PySide6.QtGui import (
+    QAction,
     QColor,
     QCloseEvent,
     QFont,
@@ -19,6 +20,7 @@ from PySide6.QtGui import (
     QPixmap,
     QTextCharFormat,
     QTextCursor,
+    QTextFormat,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -37,6 +39,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSizePolicy,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -1166,8 +1169,6 @@ class LogMarkerRail(QWidget):
         self._markers: list[tuple[int, str]] = []
         self._total_lines = 1
         self._visible_lines = 1
-        self._scrollbar_maximum = 1
-        self._marker_scroll_positions: dict[int, float] = {}
         self.setMinimumWidth(12)
         self.setMaximumWidth(12)
         self.setSizePolicy(
@@ -1182,8 +1183,6 @@ class LogMarkerRail(QWidget):
         self._markers.clear()
         self._total_lines = 1
         self._visible_lines = 1
-        self._scrollbar_maximum = 1
-        self._marker_scroll_positions.clear()
         self.update()
 
     def set_line_metrics(self, total_lines: int, visible_lines: int) -> None:
@@ -1196,8 +1195,9 @@ class LogMarkerRail(QWidget):
         scrollbar_maximum: int,
         marker_scroll_positions: dict[int, float],
     ) -> None:
-        self._scrollbar_maximum = max(scrollbar_maximum, 1)
-        self._marker_scroll_positions = marker_scroll_positions
+        # Kept for compatibility with the caller; marker placement intentionally
+        # uses document line numbers because QPlainTextEdit scrollbar units do
+        # not map reliably to wrapped-line geometry.
         self.update()
 
     def add_marker(self, line_number: int, marker_type: str) -> None:
@@ -1223,8 +1223,18 @@ class LogMarkerRail(QWidget):
             self._marker_positions(),
             key=lambda marker: self._marker_priority(marker[1]),
         ):
-            marker_height = 6 if marker_type == "SUCCESS" else 3
-            marker_width = 9 if marker_type == "SUCCESS" else 5
+            marker_height = {
+                "SUCCESS": 6,
+                "ERROR": 5,
+                "WARNING": 5,
+                "START": 3,
+            }.get(marker_type, 3)
+            marker_width = {
+                "SUCCESS": 9,
+                "ERROR": 8,
+                "WARNING": 8,
+                "START": 5,
+            }.get(marker_type, 5)
             marker_width = min(marker_width, self.width())
             marker_x = (self.width() - marker_width) // 2
             painter.fillRect(
@@ -1266,22 +1276,9 @@ class LogMarkerRail(QWidget):
         top_inset = 16
         bottom_inset = 22
         usable_height = max(self.height() - top_inset - bottom_inset - 1, 1)
-        if line_number in self._marker_scroll_positions:
-            scroll_position = min(
-                max(self._marker_scroll_positions[line_number], 0),
-                self._scrollbar_maximum,
-            )
-            return top_inset + int(
-                (scroll_position / self._scrollbar_maximum) * usable_height
-            )
-
-        denominator = max(self._total_lines - self._visible_lines, 1)
-        half_viewport = self._visible_lines / 2
-        scroll_position = min(
-            max(line_number - half_viewport, 0),
-            denominator,
-        )
-        return top_inset + int((scroll_position / denominator) * usable_height)
+        denominator = max(self._total_lines - 1, 1)
+        clamped_line = min(max(line_number, 0), denominator)
+        return top_inset + int((clamped_line / denominator) * usable_height)
 
     @staticmethod
     def _marker_priority(marker_type: str) -> int:
@@ -1343,6 +1340,11 @@ class MainWindow(QMainWindow):
         self.is_running = False
         self.worker_thread: QThread | None = None
         self.worker: UploadWorker | None = None
+        self.current_log_path: Path | None = None
+        self.connection_status_text = "Karakeep: Not configured"
+        self.marker_metrics_update_scheduled = False
+        self.highlighted_console_line: int | None = None
+        self.current_marker_line: int | None = None
         self.pending_log_entries: deque[tuple[str, str, str | None]] = deque()
         self.pending_finish_stopped: bool | None = None
         self.pending_dry_run_estimate_lines: list[tuple[str, str, str | None]] = []
@@ -1352,6 +1354,7 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle(APP_NAME)
         self.resize(900, 650)
+        self._create_menu_bar()
 
         self.connection_settings_button = QPushButton("Connection Settings")
         self.connection_settings_button.clicked.connect(
@@ -1372,6 +1375,12 @@ class MainWindow(QMainWindow):
         self.connection_status_label = QLabel("Karakeep: Not configured")
         self.connection_status_label.setAlignment(
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        self.connection_status_label.setMinimumWidth(180)
+        self.connection_status_label.setMaximumWidth(360)
+        self.connection_status_label.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Fixed,
         )
 
         button_layout = QHBoxLayout()
@@ -1396,6 +1405,9 @@ class MainWindow(QMainWindow):
         self.console_marker_rail.marker_clicked.connect(
             self._scroll_console_to_line
         )
+        self.console.document().documentLayout().documentSizeChanged.connect(
+            lambda _size: self._schedule_console_marker_metrics_update()
+        )
 
         self.current_file_label = QLabel("Current file: —")
         self.progress_bar = QProgressBar()
@@ -1404,15 +1416,19 @@ class MainWindow(QMainWindow):
         self.progress_bar.setFormat("%p%")
 
         self.summary_label = QLabel(
-            "Succeeded: 0    Failed: 0    Remaining: 0"
+            ""
         )
         self.summary_label.setTextFormat(Qt.TextFormat.RichText)
+        self.summary_label.setMinimumWidth(0)
+        self.summary_label.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
         self.clear_console_button = QPushButton("Clear Console")
         self.clear_console_button.clicked.connect(self._clear_console)
 
         bottom_status_layout = QHBoxLayout()
-        bottom_status_layout.addWidget(self.summary_label)
-        bottom_status_layout.addStretch(1)
+        bottom_status_layout.addWidget(self.summary_label, 1)
         bottom_status_layout.addWidget(self.clear_console_button)
 
         central_widget = QWidget()
@@ -1434,10 +1450,108 @@ class MainWindow(QMainWindow):
 
         self._restore_window_state()
         self._update_connection_state()
+        self._update_summary()
         self._log("KKUpload ready.")
         for message, level in preference_load_result.messages:
             self._log(message, level=level)
         QTimer.singleShot(0, self._prompt_for_connection_if_needed)
+
+    def _create_menu_bar(self) -> None:
+        file_menu = self.menuBar().addMenu("&File")
+
+        save_log_action = QAction("Save Log", self)
+        save_log_action.setShortcut("Ctrl+S")
+        save_log_action.triggered.connect(self._save_log)
+        file_menu.addAction(save_log_action)
+
+        save_log_as_action = QAction("Save Log As...", self)
+        save_log_as_action.setShortcut("Ctrl+Shift+S")
+        save_log_as_action.triggered.connect(self._save_log_as)
+        file_menu.addAction(save_log_as_action)
+
+        file_menu.addSeparator()
+
+        exit_action = QAction("Exit", self)
+        exit_action.triggered.connect(self.close)
+        file_menu.addAction(exit_action)
+
+        edit_menu = self.menuBar().addMenu("&Edit")
+        preferences_action = QAction("Preferences", self)
+        preferences_action.triggered.connect(
+            lambda: self._show_not_implemented("Preferences")
+        )
+        edit_menu.addAction(preferences_action)
+
+        search_menu = self.menuBar().addMenu("&Search")
+        find_action = QAction("Find", self)
+        find_action.setShortcut("Ctrl+F")
+        find_action.triggered.connect(lambda: self._show_not_implemented("Find"))
+        search_menu.addAction(find_action)
+
+        search_menu.addSeparator()
+
+        self._add_navigation_menu_action(
+            search_menu,
+            "Prev Issue",
+            "Ctrl+Comma",
+            "Ctrl+,",
+            "ISSUE",
+            -1,
+        )
+
+        self._add_navigation_menu_action(
+            search_menu,
+            "Next Issue",
+            "Ctrl+Period",
+            "Ctrl+.",
+            "ISSUE",
+            1,
+        )
+
+        self._add_navigation_menu_action(
+            search_menu,
+            "Prev Error",
+            "Ctrl+Shift+Comma",
+            "Ctrl+Shift+,",
+            "ERROR",
+            -1,
+        )
+
+        self._add_navigation_menu_action(
+            search_menu,
+            "Next Error",
+            "Ctrl+Shift+Period",
+            "Ctrl+Shift+.",
+            "ERROR",
+            1,
+        )
+
+        help_menu = self.menuBar().addMenu("&Help")
+        about_action = QAction("About", self)
+        about_action.triggered.connect(self._show_about)
+        help_menu.addAction(about_action)
+
+    def _add_navigation_menu_action(
+        self,
+        menu,
+        label: str,
+        display_shortcut: str,
+        keyboard_shortcut: str,
+        marker_group: str,
+        direction: int,
+    ) -> None:
+        def navigate() -> None:
+            self._navigate_console_marker(marker_group, direction)
+
+        menu_action = QAction(f"{label}\t{display_shortcut}", self)
+        menu_action.triggered.connect(navigate)
+        menu.addAction(menu_action)
+
+        shortcut_action = QAction(self)
+        shortcut_action.setShortcut(keyboard_shortcut)
+        shortcut_action.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
+        shortcut_action.triggered.connect(navigate)
+        self.addAction(shortcut_action)
 
     def _open_connection_settings(self) -> bool:
         dialog = ConnectionSettingsDialog(
@@ -1454,6 +1568,62 @@ class MainWindow(QMainWindow):
         self._log("Connection settings saved.")
         self._update_connection_state()
         return True
+
+    def _save_log(self) -> None:
+        if self.current_log_path is None:
+            self._save_log_as()
+            return
+
+        self._write_log_to_path(self.current_log_path)
+
+    def _save_log_as(self) -> None:
+        default_name = (
+            f"kkupload-log-{datetime.now().strftime('%Y%m%d-%H%M%S')}.txt"
+        )
+        default_path = str(Path.home() / "Documents" / default_name)
+        selected, _selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Save Log As",
+            default_path,
+            "Text files (*.txt);;All files (*.*)",
+        )
+
+        if not selected:
+            return
+
+        self.current_log_path = Path(selected)
+        self._write_log_to_path(self.current_log_path)
+
+    def _write_log_to_path(self, path: Path) -> None:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(self.console.toPlainText(), encoding="utf-8")
+        except OSError as exc:
+            QMessageBox.critical(
+                self,
+                "Unable to Save Log",
+                f"Could not save the log file:\n\n{path}\n\n{exc}",
+            )
+            return
+
+        self._log(f"Log saved: {path}", level="SUCCESS")
+
+    def _show_not_implemented(self, feature_name: str) -> None:
+        QMessageBox.information(
+            self,
+            feature_name,
+            f"{feature_name} is not implemented yet.",
+        )
+
+    def _show_about(self) -> None:
+        QMessageBox.about(
+            self,
+            "About KKUpload",
+            (
+                "KKUpload\n\n"
+                "A desktop uploader for organizing local media in Karakeep."
+            ),
+        )
 
     def _prompt_for_connection_if_needed(self) -> None:
         if self._has_connection_settings():
@@ -1486,11 +1656,23 @@ class MainWindow(QMainWindow):
             server_url = str(
                 self.settings.value("connection/server_url", "") or ""
             ).strip()
-            self.connection_status_label.setText(server_url)
+            self.connection_status_text = server_url
+            self.connection_status_label.setToolTip(server_url)
             self.connection_status_label.setContentsMargins(0, 0, 18, 0)
         else:
-            self.connection_status_label.setText("Karakeep: Not configured")
+            self.connection_status_text = "Karakeep: Not configured"
+            self.connection_status_label.setToolTip("")
             self.connection_status_label.setContentsMargins(0, 0, 0, 0)
+        self._update_connection_status_label_text()
+
+    def _update_connection_status_label_text(self) -> None:
+        available_width = max(self.connection_status_label.width() - 8, 40)
+        elided = self.connection_status_label.fontMetrics().elidedText(
+            self.connection_status_text,
+            Qt.TextElideMode.ElideLeft,
+            available_width,
+        )
+        self.connection_status_label.setText(elided)
 
     def _open_upload_dialog(self) -> None:
         if not self._has_connection_settings():
@@ -1811,6 +1993,24 @@ class MainWindow(QMainWindow):
         self.log_flush_timer.stop()
         self.console.clear()
         self.console_marker_rail.clear_markers()
+        self.highlighted_console_line = None
+        self.current_marker_line = None
+        self.current_index = 0
+        self.succeeded_count = 0
+        self.failed_count = 0
+        self.not_processed_count = 0
+        self.resolved_conflict_count = 0
+        self.unsupported_count = 0
+        self.failed_files.clear()
+        self.completed_operations = 0
+        self.total_operations = 0
+        self.total_files = 0
+        self.job_started_at = None
+        self.current_file_label.setText("Current file: -")
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.console.setExtraSelections([])
+        self._update_summary()
         self._write_pending_finish_if_ready()
 
     def _finish_batch(
@@ -1962,7 +2162,7 @@ class MainWindow(QMainWindow):
         for _ in range(count):
             cursor.insertBlock()
 
-        self._update_console_marker_metrics()
+        self._schedule_console_marker_metrics_update()
         if should_auto_scroll:
             scrollbar = self.console.verticalScrollBar()
             scrollbar.setValue(scrollbar.maximum())
@@ -1984,6 +2184,7 @@ class MainWindow(QMainWindow):
 
         if not self.pending_log_entries:
             self.log_flush_timer.stop()
+            self._schedule_console_marker_metrics_update()
             self._write_pending_finish_if_ready()
 
     def _write_pending_finish_if_ready(self) -> None:
@@ -2075,11 +2276,10 @@ class MainWindow(QMainWindow):
             )
 
         total_lines = self.console.document().blockCount()
-        self._update_console_marker_metrics()
         marker_type = self._marker_type_for_log(message, level, message_color)
         if marker_type is not None:
             self.console_marker_rail.add_marker(total_lines - 1, marker_type)
-            self._update_console_marker_metrics()
+        self._schedule_console_marker_metrics_update()
 
         if should_auto_scroll:
             scrollbar = self.console.verticalScrollBar()
@@ -2095,9 +2295,84 @@ class MainWindow(QMainWindow):
         if not block.isValid():
             return
 
+        self.current_marker_line = line_number
         cursor = QTextCursor(block)
         self.console.setTextCursor(cursor)
         self.console.centerCursor()
+        self._highlight_console_line(line_number)
+
+    def _highlight_console_line(self, line_number: int) -> None:
+        document = self.console.document()
+        block = document.findBlockByNumber(line_number)
+        if not block.isValid():
+            self.highlighted_console_line = None
+            self.console.setExtraSelections([])
+            return
+
+        self.highlighted_console_line = line_number
+        selection = QTextEdit.ExtraSelection()
+        selection.cursor = QTextCursor(block)
+        selection.cursor.clearSelection()
+
+        highlight_format = QTextCharFormat()
+        highlight_format.setBackground(QColor("#f59e0b"))
+        highlight_format.setProperty(
+            QTextFormat.Property.FullWidthSelection,
+            True,
+        )
+        selection.format = highlight_format
+        self.console.setExtraSelections([selection])
+
+    def _navigate_console_marker(self, marker_group: str, direction: int) -> None:
+        markers = self._markers_for_navigation(marker_group)
+        if not markers:
+            return
+
+        direction = 1 if direction >= 0 else -1
+
+        current_line = self.current_marker_line
+        if current_line is None:
+            next_index = 0 if direction > 0 else len(markers) - 1
+        elif direction > 0:
+            next_index = next(
+                (
+                    index
+                    for index, marker in enumerate(markers)
+                    if marker[0] > current_line
+                ),
+                0,
+            )
+        else:
+            next_index = next(
+                (
+                    index
+                    for index in range(len(markers) - 1, -1, -1)
+                    if markers[index][0] < current_line
+                ),
+                len(markers) - 1,
+            )
+
+        line_number = markers[next_index][0]
+        self._scroll_console_to_line(line_number)
+
+    def _markers_for_navigation(
+        self,
+        marker_group: str,
+    ) -> tuple[tuple[int, str], ...]:
+        if marker_group == "ERROR":
+            wanted = {"ERROR"}
+        else:
+            wanted = {"ERROR", "WARNING"}
+
+        seen_lines: set[int] = set()
+        markers: list[tuple[int, str]] = []
+        for line_number, marker_type in self.console_marker_rail.markers():
+            if marker_type not in wanted or line_number in seen_lines:
+                continue
+            seen_lines.add(line_number)
+            markers.append((line_number, marker_type))
+
+        return tuple(sorted(markers, key=lambda marker: marker[0]))
 
     @staticmethod
     def _marker_type_for_log(
@@ -2127,35 +2402,20 @@ class MainWindow(QMainWindow):
         return max(self.console.viewport().height() // line_height, 1)
 
     def _update_console_marker_metrics(self) -> None:
+        self.marker_metrics_update_scheduled = False
         self.console_marker_rail.set_line_metrics(
             self.console.document().blockCount(),
             self._visible_console_lines(),
         )
-        self.console_marker_rail.set_scroll_metrics(
-            self.console.verticalScrollBar().maximum(),
-            self._console_marker_scroll_positions(),
-        )
+        self.console_marker_rail.update()
 
-    def _console_marker_scroll_positions(self) -> dict[int, float]:
-        document = self.console.document()
-        layout = document.documentLayout()
-        viewport_height = self.console.viewport().height()
-        scrollbar_maximum = self.console.verticalScrollBar().maximum()
-        positions: dict[int, float] = {}
+    def _schedule_console_marker_metrics_update(self) -> None:
+        if self.marker_metrics_update_scheduled:
+            return
 
-        for line_number, _marker_type in self.console_marker_rail.markers():
-            block = document.findBlockByNumber(line_number)
-            if not block.isValid():
-                continue
-
-            block_rect = layout.blockBoundingRect(block)
-            target_scroll = block_rect.center().y() - (viewport_height / 2)
-            positions[line_number] = min(
-                max(target_scroll, 0.0),
-                float(scrollbar_maximum),
-            )
-
-        return positions
+        self.marker_metrics_update_scheduled = True
+        QTimer.singleShot(0, self._update_console_marker_metrics)
+        QTimer.singleShot(50, self._update_console_marker_metrics)
 
     def _console_log_colors(self) -> dict[str, str]:
         base_color = self.console.palette().base().color()
@@ -2194,6 +2454,8 @@ class MainWindow(QMainWindow):
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
+        if hasattr(self, "connection_status_label"):
+            self._update_connection_status_label_text()
         if hasattr(self, "console_marker_rail"):
             self._update_console_marker_metrics()
 

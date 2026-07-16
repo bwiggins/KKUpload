@@ -1,12 +1,12 @@
 {
   "samples": [
     {
-      "completed_at": "2026-07-15T04:15:35.327844+00:00",
-      "file_count": 28,
-      "source_bytes": 6023020,
-      "uploaded_bytes": 6023020,
-      "upload_seconds": 30.811999999452382,
-      "total_seconds": 162.06300000008196
+      "completed_at": "2026-07-15T18:26:27.715763+00:00",
+      "file_count": 1156,
+      "source_bytes": 299945243,
+      "uploaded_bytes": 234201642,
+      "upload_seconds": 1134.5340000060387,
+      "total_seconds": 6461.311999999918
     }
   ]
 }
