@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Final
 
 import keyring
-from PySide6.QtCore import QSettings, QSize, QThread, QTimer, Qt, Signal
+from PySide6.QtCore import QEvent, QSettings, QSize, QThread, QTimer, Qt, Signal
 from PySide6.QtGui import (
     QAction,
     QColor,
@@ -447,10 +447,12 @@ class UploadDialog(QDialog):
         self,
         settings: QSettings,
         parent: QWidget | None = None,
+        locked_upload_folder: Path | None = None,
     ) -> None:
         super().__init__(parent)
 
         self.settings = settings
+        self.locked_upload_folder = locked_upload_folder
         self.configuration: UploadConfiguration | None = None
         self._manual_completed_folder = ""
         self._manual_error_folder = ""
@@ -465,6 +467,10 @@ class UploadDialog(QDialog):
             "history/upload_folders",
             "Select Upload Folder",
         )
+        if locked_upload_folder is not None:
+            self.upload_field.set_text(str(locked_upload_folder))
+            self.upload_field.setEnabled(False)
+
         self.completed_field = EditableHistoryField(
             settings,
             "history/completed_folders",
@@ -1483,6 +1489,7 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle(APP_NAME)
         self.resize(900, 650)
+        self.setAcceptDrops(True)
         self._create_menu_bar()
 
         self.connection_settings_button = QPushButton("Connection Settings")
@@ -1491,7 +1498,7 @@ class MainWindow(QMainWindow):
         )
 
         self.upload_button = QPushButton("Configure Upload")
-        self.upload_button.clicked.connect(self._open_upload_dialog)
+        self.upload_button.clicked.connect(lambda: self._open_upload_dialog())
 
         self.pause_button = QPushButton("Pause")
         self.pause_button.setEnabled(False)
@@ -1522,6 +1529,10 @@ class MainWindow(QMainWindow):
         button_layout.addWidget(self.connection_status_label)
 
         self.console = StatusConsole(Path(__file__).with_name("naut.png"))
+        self.console.setAcceptDrops(True)
+        self.console.viewport().setAcceptDrops(True)
+        self.console.installEventFilter(self)
+        self.console.viewport().installEventFilter(self)
         self.console.setReadOnly(True)
         self.console.setPlaceholderText(
             "Upload activity will appear here."
@@ -1823,13 +1834,94 @@ class MainWindow(QMainWindow):
         )
         self.connection_status_label.setText(elided)
 
-    def _open_upload_dialog(self) -> None:
+    def eventFilter(self, watched, event) -> bool:  # type: ignore[no-untyped-def]
+        if watched in {self.console, self.console.viewport()}:
+            if event.type() in {
+                QEvent.Type.DragEnter,
+                QEvent.Type.DragMove,
+            }:
+                if event.mimeData().hasUrls():
+                    event.acceptProposedAction()
+                    return True
+
+            if event.type() == QEvent.Type.Drop:
+                self._handle_upload_folder_drop(event)
+                return True
+
+        return super().eventFilter(watched, event)
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dragMoveEvent(self, event) -> None:  # noqa: N802
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event) -> None:  # noqa: N802
+        self._handle_upload_folder_drop(event)
+
+    def _handle_upload_folder_drop(self, event) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+        paths = self._local_paths_from_drop_event(event)
+
+        if self.is_running or self.is_paused:
+            QMessageBox.information(
+                self,
+                "Batch Already Running",
+                (
+                    "A batch is already running. Wait until the current "
+                    "batch is complete before starting another."
+                ),
+            )
+            return
+
+        if len(paths) != 1:
+            QMessageBox.information(
+                self,
+                "Drop One Folder",
+                "Drop a single folder to configure an upload batch.",
+            )
+            return
+
+        dropped_path = paths[0]
+        if not dropped_path.is_dir():
+            QMessageBox.information(
+                self,
+                "Drop a Folder",
+                "KKUpload drag-and-drop currently accepts folders only.",
+            )
+            return
+
+        self._open_upload_dialog(locked_upload_folder=dropped_path.resolve())
+
+    @staticmethod
+    def _local_paths_from_drop_event(event) -> list[Path]:  # type: ignore[no-untyped-def]
+        paths: list[Path] = []
+        for url in event.mimeData().urls():
+            if not url.isLocalFile():
+                continue
+            local_file = url.toLocalFile()
+            if local_file:
+                paths.append(Path(local_file))
+        return paths
+
+    def _open_upload_dialog(
+        self,
+        locked_upload_folder: Path | None = None,
+    ) -> None:
         if not self._has_connection_settings():
             self._log("Configure Karakeep connection settings before uploading.")
             self._open_connection_settings()
             return
 
-        dialog = UploadDialog(self.settings, self)
+        dialog = UploadDialog(
+            self.settings,
+            self,
+            locked_upload_folder=locked_upload_folder,
+        )
 
         if dialog.exec() != QDialog.DialogCode.Accepted:
             self._log("Upload configuration canceled.")
