@@ -1914,8 +1914,8 @@ class MainWindow(QMainWindow):
         if self.find_dialog is None:
             return
 
-        horizontal_inset = 54
-        vertical_inset = 20
+        horizontal_inset = 132
+        vertical_inset = 8
         viewport = self.console.viewport()
         viewport_top_left = viewport.mapToGlobal(viewport.rect().topLeft())
         dialog_size = self.find_dialog.sizeHint()
@@ -1965,11 +1965,14 @@ class MainWindow(QMainWindow):
         normalized = view_mode.lower()
         if normalized == "dark":
             app.setPalette(self._dark_palette())
+            app.setStyleSheet("")
         elif normalized == "light":
             app.setPalette(self._light_palette())
+            app.setStyleSheet(self._light_stylesheet())
         else:
             if DEFAULT_APP_PALETTE is not None:
                 app.setPalette(DEFAULT_APP_PALETTE)
+            app.setStyleSheet("")
 
         if hasattr(self, "console_marker_rail"):
             self.console_marker_rail.update()
@@ -1986,7 +1989,7 @@ class MainWindow(QMainWindow):
         palette.setColor(QPalette.ColorRole.ButtonText, QColor("#202124"))
         palette.setColor(QPalette.ColorRole.ToolTipBase, QColor("#ffffff"))
         palette.setColor(QPalette.ColorRole.ToolTipText, QColor("#202124"))
-        palette.setColor(QPalette.ColorRole.Highlight, QColor("#cfe8ff"))
+        palette.setColor(QPalette.ColorRole.Highlight, QColor("#b9d8ee"))
         palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#000000"))
         palette.setColor(QPalette.ColorRole.Link, QColor("#0b57d0"))
         return palette
@@ -2007,6 +2010,128 @@ class MainWindow(QMainWindow):
         palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
         palette.setColor(QPalette.ColorRole.Link, QColor("#7dd3fc"))
         return palette
+
+    @staticmethod
+    def _light_stylesheet() -> str:
+        return """
+            QMenuBar {
+                background: #f5f5f5;
+                color: #202124;
+            }
+            QMenuBar::item {
+                background: transparent;
+                color: #202124;
+                padding: 4px 10px;
+            }
+            QMenuBar::item:selected {
+                background: #e8eaed;
+            }
+            QMenu {
+                background: #ffffff;
+                color: #202124;
+                border: 1px solid #dadce0;
+                min-width: 230px;
+            }
+            QMenu::item {
+                color: #202124;
+                padding: 5px 48px 5px 14px;
+            }
+            QMenu::item:selected {
+                background: #e8f0fe;
+                color: #202124;
+            }
+            QPushButton {
+                background: #f1f3f4;
+                color: #202124;
+                border: 1px solid #c7c7c7;
+                border-radius: 4px;
+                padding: 4px 10px;
+            }
+            QPushButton:hover {
+                background: #e8eaed;
+            }
+            QPushButton:disabled {
+                color: #6b7280;
+                background: #eeeeee;
+                border-color: #d7d7d7;
+            }
+            QLineEdit,
+            QComboBox,
+            QSpinBox,
+            QDoubleSpinBox {
+                background: #ffffff;
+                color: #202124;
+                border: 1px solid #b8b8b8;
+                border-radius: 4px;
+                padding: 3px 6px;
+                selection-background-color: #b9d8ee;
+                selection-color: #000000;
+            }
+            QComboBox:disabled,
+            QLineEdit:disabled,
+            QSpinBox:disabled,
+            QDoubleSpinBox:disabled {
+                background: #eeeeee;
+                color: #6b7280;
+                border-color: #d7d7d7;
+            }
+            QComboBox QAbstractItemView {
+                background: #ffffff;
+                color: #202124;
+                selection-background-color: #b9d8ee;
+                selection-color: #000000;
+            }
+            QPlainTextEdit {
+                selection-background-color: #b9d8ee;
+                selection-color: #000000;
+            }
+        """
+
+    @staticmethod
+    def _dark_stylesheet() -> str:
+        return """
+            QMenuBar {
+                background: #1f1f1f;
+                color: #f1f5f9;
+            }
+            QMenuBar::item {
+                background: transparent;
+                color: #f1f5f9;
+                padding: 4px 10px;
+            }
+            QMenuBar::item:selected {
+                background: #303030;
+            }
+            QMenu {
+                background: #242424;
+                color: #f1f5f9;
+                border: 1px solid #3f3f46;
+                min-width: 230px;
+            }
+            QMenu::item {
+                color: #f1f5f9;
+                padding: 5px 48px 5px 14px;
+            }
+            QMenu::item:selected {
+                background: #2f6f9f;
+                color: #ffffff;
+            }
+            QPushButton {
+                background: #303030;
+                color: #f1f5f9;
+                border: 1px solid #52525b;
+                border-radius: 4px;
+                padding: 4px 10px;
+            }
+            QPushButton:hover {
+                background: #3f3f46;
+            }
+            QPushButton:disabled {
+                color: #a1a1aa;
+                background: #27272a;
+                border-color: #3f3f46;
+            }
+        """
 
     def _open_connection_settings(self) -> bool:
         dialog = ConnectionSettingsDialog(
@@ -3053,6 +3178,7 @@ class MainWindow(QMainWindow):
             return {
                 "timestamp": "#9ca3af",
                 "default": "#e5e7eb",
+                "INFO": "#e5e7eb",
                 "SUCCESS": "#4ade80",
                 "ERROR": "#f87171",
                 "WARNING": "#facc15",
@@ -3063,6 +3189,7 @@ class MainWindow(QMainWindow):
         return {
             "timestamp": "#6b7280",
             "default": "#111827",
+            "INFO": "#111827",
             "SUCCESS": "#15803d",
             "ERROR": "#b91c1c",
             "WARNING": "#ca8a04",
