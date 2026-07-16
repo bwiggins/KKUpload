@@ -35,6 +35,7 @@ class ImageResizePreferences:
 @dataclass(frozen=True)
 class AppPreferences:
     image_resize: ImageResizePreferences
+    view_mode: str = "auto"
 
 
 @dataclass(frozen=True)
@@ -114,9 +115,14 @@ def load_preferences(app_path: Path) -> PreferenceLoadResult:
         defaults.image_resize,
     )
     messages.extend(validation_messages)
-    preferences = AppPreferences(image_resize=image_resize)
+    view_mode = _view_mode_value(raw, "view_mode", defaults.view_mode, messages)
+    preferences = AppPreferences(image_resize=image_resize, view_mode=view_mode)
 
-    if validation_messages:
+    if (
+        validation_messages
+        or "view_mode" not in raw
+        or view_mode != raw.get("view_mode", defaults.view_mode)
+    ):
         rewrite_needed = True
 
     if rewrite_needed:
@@ -271,6 +277,27 @@ def _bool_value(
     return default
 
 
+def _view_mode_value(
+    raw: dict[str, Any],
+    key: str,
+    default: str,
+    messages: list[tuple[str, str]],
+) -> str:
+    value = raw.get(key, default)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"auto", "light", "dark"}:
+            return normalized
+
+    messages.append(
+        (
+            f"Preference {key} was invalid. Using default {default}.",
+            "WARNING",
+        )
+    )
+    return default
+
+
 def _write_preferences(path: Path, preferences: AppPreferences) -> None:
     path.write_text(
         json.dumps(_preferences_to_json(preferences), indent=2) + "\n",
@@ -281,6 +308,7 @@ def _write_preferences(path: Path, preferences: AppPreferences) -> None:
 def _preferences_to_json(preferences: AppPreferences) -> dict[str, Any]:
     image_resize = preferences.image_resize
     return {
+        "view_mode": preferences.view_mode,
         "image_resize": {
             "maximum_allowed_image_size_mb": (
                 image_resize.maximum_allowed_image_size_mb

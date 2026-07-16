@@ -10,13 +10,14 @@ from pathlib import Path
 from typing import Final
 
 import keyring
-from PySide6.QtCore import QEvent, QSettings, QSize, QThread, QTimer, Qt, Signal
+from PySide6.QtCore import QEvent, QPoint, QSettings, QSize, QThread, QTimer, Qt, Signal
 from PySide6.QtGui import (
     QAction,
     QColor,
     QCloseEvent,
     QFont,
     QPainter,
+    QPalette,
     QPixmap,
     QTextCharFormat,
     QTextCursor,
@@ -67,6 +68,7 @@ DEFAULT_TAGS: Final[str] = "!!-TAGGING-!!"
 MAX_RECENT_VALUES: Final[int] = 10
 KEYRING_SERVICE: Final[str] = "KKUpload"
 KEYRING_USERNAME: Final[str] = "karakeep_api_key"
+DEFAULT_APP_PALETTE: QPalette | None = None
 
 
 @dataclass(frozen=True)
@@ -337,6 +339,13 @@ class PreferencesDialog(QDialog):
 
         image_resize = preferences.image_resize
 
+        self.view_mode_combo = QComboBox()
+        self.view_mode_combo.addItem("Auto", "auto")
+        self.view_mode_combo.addItem("Light", "light")
+        self.view_mode_combo.addItem("Dark", "dark")
+        view_mode_index = self.view_mode_combo.findData(preferences.view_mode)
+        self.view_mode_combo.setCurrentIndex(max(view_mode_index, 0))
+
         self.maximum_allowed_size_spin = QDoubleSpinBox()
         self.maximum_allowed_size_spin.setRange(0.1, 100000.0)
         self.maximum_allowed_size_spin.setDecimals(1)
@@ -391,6 +400,15 @@ class PreferencesDialog(QDialog):
         resize_group = QGroupBox("Image resizing")
         resize_group.setLayout(resize_form)
 
+        view_form = QFormLayout()
+        view_form.setFieldGrowthPolicy(
+            QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow
+        )
+        view_form.addRow("View mode:", self.view_mode_combo)
+
+        view_group = QGroupBox("Appearance")
+        view_group.setLayout(view_form)
+
         helper_text = QLabel(
             "Images larger than the maximum allowed size, or rejected by "
             "Karakeep as too large, can be resized toward the desired goal."
@@ -405,6 +423,7 @@ class PreferencesDialog(QDialog):
         self.button_box.rejected.connect(self.reject)
 
         layout = QVBoxLayout(self)
+        layout.addWidget(view_group)
         layout.addWidget(resize_group)
         layout.addWidget(helper_text)
         layout.addWidget(self.button_box)
@@ -425,6 +444,7 @@ class PreferencesDialog(QDialog):
             return
 
         self.preferences = AppPreferences(
+            view_mode=str(self.view_mode_combo.currentData()),
             image_resize=ImageResizePreferences(
                 maximum_allowed_image_size_mb=maximum_allowed,
                 desired_resize_goal_mb=desired_goal,
@@ -1253,13 +1273,178 @@ class MoveConflictDialog(QDialog):
         self.accept()
 
 
+class FindDialog(QDialog):
+    """Modeless log search dialog with live match counts."""
+
+    SEARCH_DEBOUNCE_MS: Final[int] = 150
+
+    def __init__(
+        self,
+        log_text_provider: Callable[[], str],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+
+        self.log_text_provider = log_text_provider
+        self._drag_offset: QPoint | None = None
+
+        self.setWindowTitle("Find")
+        self.setModal(False)
+        self.setWindowFlags(
+            self.windowFlags()
+            | Qt.WindowType.Tool
+            | Qt.WindowType.FramelessWindowHint
+        )
+        self.setMinimumWidth(320)
+
+        self.search_field = QLineEdit()
+        self.search_field.setPlaceholderText("Find")
+
+        self.scope_combo = QComboBox()
+        self.scope_combo.addItem("All", "all")
+        self.scope_combo.addItem("Issues", "issues")
+        self.scope_combo.addItem("Warnings", "warnings")
+        self.scope_combo.addItem("Errors", "errors")
+
+        self.count_label = QLabel("0 instances")
+
+        self.previous_button = QPushButton("Prev")
+        self.previous_button.setEnabled(False)
+        self.previous_button.setToolTip("Result navigation will be added later.")
+
+        self.next_button = QPushButton("Next")
+        self.next_button.setEnabled(False)
+        self.next_button.setToolTip("Result navigation will be added later.")
+
+        self.close_button = QPushButton("X")
+        self.close_button.setFixedWidth(32)
+        self.close_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.close_button.setStyleSheet(
+            "QPushButton { border: none; padding: 2px 6px; }"
+            "QPushButton:hover { background: palette(midlight); }"
+        )
+        self.close_button.clicked.connect(self.reject)
+
+        search_layout = QHBoxLayout()
+        search_layout.setContentsMargins(0, 0, 0, 0)
+        search_layout.addWidget(self.search_field, 1)
+        search_layout.addWidget(self.close_button)
+
+        navigation_layout = QHBoxLayout()
+        navigation_layout.setContentsMargins(0, 0, 0, 0)
+        navigation_layout.addWidget(self.previous_button)
+        navigation_layout.addWidget(self.scope_combo, 1)
+        navigation_layout.addWidget(self.next_button)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.addLayout(search_layout)
+        layout.addWidget(self.count_label)
+        layout.addLayout(navigation_layout)
+
+        self.count_timer = QTimer(self)
+        self.count_timer.setSingleShot(True)
+        self.count_timer.setInterval(self.SEARCH_DEBOUNCE_MS)
+        self.count_timer.timeout.connect(self._update_match_count)
+
+        self.search_field.textChanged.connect(self._schedule_count_update)
+        self.scope_combo.currentIndexChanged.connect(self._schedule_count_update)
+
+    def focus_search_field(self) -> None:
+        self.search_field.setFocus()
+        self.search_field.selectAll()
+        self._schedule_count_update()
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_offset = (
+                event.globalPosition().toPoint()
+                - self.frameGeometry().topLeft()
+            )
+
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if (
+            self._drag_offset is not None
+            and event.buttons() & Qt.MouseButton.LeftButton
+        ):
+            self.move(event.globalPosition().toPoint() - self._drag_offset)
+
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        self._drag_offset = None
+        super().mouseReleaseEvent(event)
+
+    def _schedule_count_update(self, *_args) -> None:  # type: ignore[no-untyped-def]
+        self.count_timer.start()
+
+    def _update_match_count(self) -> None:
+        needle = self.search_field.text()
+        if not needle:
+            self.count_label.setText("0 instances")
+            return
+
+        count = self._count_matches(
+            self.log_text_provider(),
+            needle,
+            str(self.scope_combo.currentData()),
+        )
+        instance_label = "instance" if count == 1 else "instances"
+        self.count_label.setText(f"{count} {instance_label}")
+
+    @classmethod
+    def _count_matches(cls, log_text: str, needle: str, scope: str) -> int:
+        if not needle:
+            return 0
+
+        haystack = cls._scoped_log_text(log_text, scope).casefold()
+        return haystack.count(needle.casefold())
+
+    @staticmethod
+    def _scoped_log_text(log_text: str, scope: str) -> str:
+        if scope == "all":
+            return log_text
+
+        lines = log_text.splitlines()
+
+        if scope == "errors":
+            return "\n".join(line for line in lines if "[ERROR]" in line)
+
+        if scope == "warnings":
+            return "\n".join(line for line in lines if "[WARNING]" in line)
+
+        if scope == "issues":
+            return "\n".join(
+                line
+                for line in lines
+                if "[ERROR]" in line or "[WARNING]" in line
+            )
+
+        return log_text
+
+
 class StatusConsole(QPlainTextEdit):
     """Read-only log console with a subtle bottom-right watermark."""
+
+    line_clicked = Signal(int)
 
     def __init__(self, watermark_path: Path, parent: QWidget | None = None) -> None:
         super().__init__(parent)
 
         self._watermark = QPixmap(str(watermark_path))
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        super().mousePressEvent(event)
+
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+
+        cursor = self.cursorForPosition(event.position().toPoint())
+        block_number = cursor.blockNumber()
+        if block_number >= 0:
+            self.line_clicked.emit(block_number)
 
     def paintEvent(self, event) -> None:  # noqa: N802
         super().paintEvent(event)
@@ -1457,6 +1642,7 @@ class MainWindow(QMainWindow):
         )
         preference_load_result = load_preferences(Path(__file__))
         self.preferences: AppPreferences = preference_load_result.preferences
+        self._apply_view_mode(self.preferences.view_mode)
 
         self.configuration: UploadConfiguration | None = None
         self.current_index = 0
@@ -1475,6 +1661,7 @@ class MainWindow(QMainWindow):
         self.is_running = False
         self.worker_thread: QThread | None = None
         self.worker: UploadWorker | None = None
+        self.find_dialog: FindDialog | None = None
         self.current_log_path: Path | None = None
         self.connection_status_text = "Karakeep: Not configured"
         self.marker_metrics_update_scheduled = False
@@ -1533,6 +1720,7 @@ class MainWindow(QMainWindow):
         self.console.viewport().setAcceptDrops(True)
         self.console.installEventFilter(self)
         self.console.viewport().installEventFilter(self)
+        self.console.line_clicked.connect(self._highlight_console_line)
         self.console.setReadOnly(True)
         self.console.setPlaceholderText(
             "Upload activity will appear here."
@@ -1599,6 +1787,20 @@ class MainWindow(QMainWindow):
     def _create_menu_bar(self) -> None:
         file_menu = self.menuBar().addMenu("&File")
 
+        configure_upload_action = QAction("Configure Upload", self)
+        configure_upload_action.setShortcut("Ctrl+U")
+        configure_upload_action.triggered.connect(
+            lambda: self._open_upload_dialog()
+        )
+        file_menu.addAction(configure_upload_action)
+
+        pause_action = QAction("Pause / Unpause", self)
+        pause_action.setShortcut("Ctrl+Space")
+        pause_action.triggered.connect(self._toggle_pause)
+        file_menu.addAction(pause_action)
+
+        file_menu.addSeparator()
+
         save_log_action = QAction("Save Log", self)
         save_log_action.setShortcut("Ctrl+S")
         save_log_action.triggered.connect(self._save_log)
@@ -1623,7 +1825,7 @@ class MainWindow(QMainWindow):
         search_menu = self.menuBar().addMenu("&Search")
         find_action = QAction("Find", self)
         find_action.setShortcut("Ctrl+F")
-        find_action.triggered.connect(lambda: self._show_not_implemented("Find"))
+        find_action.triggered.connect(self._open_find_dialog)
         search_menu.addAction(find_action)
 
         search_menu.addSeparator()
@@ -1665,6 +1867,12 @@ class MainWindow(QMainWindow):
         )
 
         help_menu = self.menuBar().addMenu("&Help")
+        keyboard_shortcuts_action = QAction("Keyboard Shortcuts", self)
+        keyboard_shortcuts_action.triggered.connect(self._show_keyboard_shortcuts)
+        help_menu.addAction(keyboard_shortcuts_action)
+
+        help_menu.addSeparator()
+
         about_action = QAction("About", self)
         about_action.triggered.connect(self._show_about)
         help_menu.addAction(about_action)
@@ -1691,6 +1899,41 @@ class MainWindow(QMainWindow):
         shortcut_action.triggered.connect(navigate)
         self.addAction(shortcut_action)
 
+    def _open_find_dialog(self) -> None:
+        if self.find_dialog is None:
+            self.find_dialog = FindDialog(self.console.toPlainText, self)
+            self.find_dialog.finished.connect(self._clear_find_dialog_reference)
+
+        self.find_dialog.show()
+        self._position_find_dialog()
+        self.find_dialog.raise_()
+        self.find_dialog.activateWindow()
+        self.find_dialog.focus_search_field()
+
+    def _position_find_dialog(self) -> None:
+        if self.find_dialog is None:
+            return
+
+        horizontal_inset = 54
+        vertical_inset = 20
+        viewport = self.console.viewport()
+        viewport_top_left = viewport.mapToGlobal(viewport.rect().topLeft())
+        dialog_size = self.find_dialog.sizeHint()
+        x = (
+            viewport_top_left.x()
+            + viewport.width()
+            - dialog_size.width()
+            - horizontal_inset
+        )
+        y = viewport_top_left.y() + vertical_inset
+        self.find_dialog.move(
+            max(x, viewport_top_left.x() + horizontal_inset),
+            y,
+        )
+
+    def _clear_find_dialog_reference(self, *_args) -> None:  # type: ignore[no-untyped-def]
+        self.find_dialog = None
+
     def _open_preferences(self) -> bool:
         dialog = PreferencesDialog(self.preferences, self)
 
@@ -1710,8 +1953,60 @@ class MainWindow(QMainWindow):
             return False
 
         self.preferences = dialog.preferences
+        self._apply_view_mode(self.preferences.view_mode)
         self._log(f"Preferences saved: {path}", level="SUCCESS")
         return True
+
+    def _apply_view_mode(self, view_mode: str) -> None:
+        app = QApplication.instance()
+        if app is None:
+            return
+
+        normalized = view_mode.lower()
+        if normalized == "dark":
+            app.setPalette(self._dark_palette())
+        elif normalized == "light":
+            app.setPalette(self._light_palette())
+        else:
+            if DEFAULT_APP_PALETTE is not None:
+                app.setPalette(DEFAULT_APP_PALETTE)
+
+        if hasattr(self, "console_marker_rail"):
+            self.console_marker_rail.update()
+
+    @staticmethod
+    def _light_palette() -> QPalette:
+        palette = QPalette()
+        palette.setColor(QPalette.ColorRole.Window, QColor("#f5f5f5"))
+        palette.setColor(QPalette.ColorRole.WindowText, QColor("#202124"))
+        palette.setColor(QPalette.ColorRole.Base, QColor("#ffffff"))
+        palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#f1f3f4"))
+        palette.setColor(QPalette.ColorRole.Text, QColor("#202124"))
+        palette.setColor(QPalette.ColorRole.Button, QColor("#f1f3f4"))
+        palette.setColor(QPalette.ColorRole.ButtonText, QColor("#202124"))
+        palette.setColor(QPalette.ColorRole.ToolTipBase, QColor("#ffffff"))
+        palette.setColor(QPalette.ColorRole.ToolTipText, QColor("#202124"))
+        palette.setColor(QPalette.ColorRole.Highlight, QColor("#cfe8ff"))
+        palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#000000"))
+        palette.setColor(QPalette.ColorRole.Link, QColor("#0b57d0"))
+        return palette
+
+    @staticmethod
+    def _dark_palette() -> QPalette:
+        palette = QPalette()
+        palette.setColor(QPalette.ColorRole.Window, QColor("#1f1f1f"))
+        palette.setColor(QPalette.ColorRole.WindowText, QColor("#f1f5f9"))
+        palette.setColor(QPalette.ColorRole.Base, QColor("#242424"))
+        palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#303030"))
+        palette.setColor(QPalette.ColorRole.Text, QColor("#f1f5f9"))
+        palette.setColor(QPalette.ColorRole.Button, QColor("#303030"))
+        palette.setColor(QPalette.ColorRole.ButtonText, QColor("#f1f5f9"))
+        palette.setColor(QPalette.ColorRole.ToolTipBase, QColor("#303030"))
+        palette.setColor(QPalette.ColorRole.ToolTipText, QColor("#f1f5f9"))
+        palette.setColor(QPalette.ColorRole.Highlight, QColor("#2f6f9f"))
+        palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
+        palette.setColor(QPalette.ColorRole.Link, QColor("#7dd3fc"))
+        return palette
 
     def _open_connection_settings(self) -> bool:
         dialog = ConnectionSettingsDialog(
@@ -1781,8 +2076,29 @@ class MainWindow(QMainWindow):
             "About KKUpload",
             (
                 "KKUpload\n\n"
-                "A desktop uploader for organizing local media in Karakeep."
+                "A desktop uploader for organizing local media in Karakeep.\n\n"
+                "Designed by Brad Wiggins."
             ),
+        )
+
+    def _show_keyboard_shortcuts(self) -> None:
+        message = (
+            "<table>"
+            "<tr><td><b>Configure Upload</b></td><td>&nbsp;&nbsp;Ctrl+U</td></tr>"
+            "<tr><td><b>Pause / Unpause</b></td><td>&nbsp;&nbsp;Ctrl+Space</td></tr>"
+            "<tr><td><b>Save Log</b></td><td>&nbsp;&nbsp;Ctrl+S</td></tr>"
+            "<tr><td><b>Save Log As</b></td><td>&nbsp;&nbsp;Ctrl+Shift+S</td></tr>"
+            "<tr><td><b>Find</b></td><td>&nbsp;&nbsp;Ctrl+F</td></tr>"
+            "<tr><td><b>Prev Issue</b></td><td>&nbsp;&nbsp;Ctrl+Comma</td></tr>"
+            "<tr><td><b>Next Issue</b></td><td>&nbsp;&nbsp;Ctrl+Period</td></tr>"
+            "<tr><td><b>Prev Error</b></td><td>&nbsp;&nbsp;Ctrl+Shift+Comma</td></tr>"
+            "<tr><td><b>Next Error</b></td><td>&nbsp;&nbsp;Ctrl+Shift+Period</td></tr>"
+            "</table>"
+        )
+        QMessageBox.information(
+            self,
+            "Keyboard Shortcuts",
+            message,
         )
 
     def _prompt_for_connection_if_needed(self) -> None:
@@ -2614,18 +2930,26 @@ class MainWindow(QMainWindow):
             return
 
         self.highlighted_console_line = line_number
+        self.current_marker_line = line_number
         selection = QTextEdit.ExtraSelection()
         selection.cursor = QTextCursor(block)
         selection.cursor.clearSelection()
 
         highlight_format = QTextCharFormat()
-        highlight_format.setBackground(QColor("#f59e0b"))
+        highlight_format.setBackground(QColor(self._console_highlight_color()))
         highlight_format.setProperty(
             QTextFormat.Property.FullWidthSelection,
             True,
         )
         selection.format = highlight_format
         self.console.setExtraSelections([selection])
+
+    def _console_highlight_color(self) -> str:
+        base_color = self.console.palette().base().color()
+        if base_color.lightness() < 128:
+            return "#2f6f9f"
+
+        return "#b9d8ee"
 
     def _navigate_console_marker(self, marker_group: str, direction: int) -> None:
         markers = self._markers_for_navigation(marker_group)
@@ -2802,9 +3126,12 @@ class MainWindow(QMainWindow):
 
 
 def main() -> int:
+    global DEFAULT_APP_PALETTE
+
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setOrganizationName(ORGANIZATION_NAME)
+    DEFAULT_APP_PALETTE = app.palette()
 
     window = MainWindow()
     window.show()
