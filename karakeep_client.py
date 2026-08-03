@@ -172,6 +172,70 @@ class KarakeepClient:
             return tuple(self._parse_list(item) for item in data)
         return tuple(self._parse_list(item) for item in data.get("lists", []))
 
+    def list_bookmarks(self, *, include_content: bool = False) -> tuple[dict, ...]:
+        return tuple(self.iter_bookmarks(include_content=include_content))
+
+    def iter_bookmarks(self, *, include_content: bool = False):
+        bookmarks: list[dict] = []
+        cursor: str | None = None
+
+        while True:
+            params: dict[str, str | int | bool] = {
+                "limit": 100,
+                "includeContent": include_content,
+            }
+            if cursor is not None:
+                params["cursor"] = cursor
+
+            response = self._request("GET", "/bookmarks", params=params)
+            data = response.json()
+
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict):
+                        yield item
+                break
+
+            for item in data.get("bookmarks", []):
+                if isinstance(item, dict):
+                    yield item
+            cursor = data.get("nextCursor")
+            if cursor is None:
+                break
+
+    def list_tags(self) -> tuple[dict, ...]:
+        tags: list[dict] = []
+        cursor: str | None = None
+
+        while True:
+            params: dict[str, str | int] = {"limit": 100}
+            if cursor is not None:
+                params["cursor"] = cursor
+
+            response = self._request("GET", "/tags", params=params)
+            data = response.json()
+
+            if isinstance(data, list):
+                tags.extend(item for item in data if isinstance(item, dict))
+                break
+
+            tags.extend(item for item in data.get("tags", []) if isinstance(item, dict))
+            cursor = data.get("nextCursor")
+            if cursor is None:
+                break
+
+        return tuple(tags)
+
+    def stream_asset_bytes(self, asset_id: str):
+        with httpx.stream(
+            "GET",
+            self.api_base_url + f"/assets/{asset_id}",
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            timeout=self.timeout,
+        ) as response:
+            response.raise_for_status()
+            yield from response.iter_bytes()
+
     def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
         response = httpx.request(
             method,

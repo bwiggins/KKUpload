@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import sys
 import time
+import re
+import webbrowser
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -58,6 +60,7 @@ from preferences import (
 )
 from scanner import validate_separate_folder_tree
 from timing_stats import default_timing_stats_path
+from duplicate_checker import DuplicateCheckConfig, DuplicateCheckWorker
 from upload_worker import MoveConflictRequest, UploadJobConfig, UploadWorker
 
 
@@ -1442,9 +1445,22 @@ class StatusConsole(QPlainTextEdit):
             return
 
         cursor = self.cursorForPosition(event.position().toPoint())
+        block_text = cursor.block().text()
+        clicked_url = self._url_at_cursor(block_text, cursor.positionInBlock())
+        if clicked_url is not None:
+            webbrowser.open(clicked_url)
+            return
+
         block_number = cursor.blockNumber()
         if block_number >= 0:
             self.line_clicked.emit(block_number)
+
+    @staticmethod
+    def _url_at_cursor(text: str, position: int) -> str | None:
+        for match in re.finditer(r"https?://\S+", text):
+            if match.start() <= position <= match.end():
+                return match.group(0).rstrip(".,);]")
+        return None
 
     def paintEvent(self, event) -> None:  # noqa: N802
         super().paintEvent(event)
@@ -1652,6 +1668,14 @@ class MainWindow(QMainWindow):
         self.resolved_conflict_count = 0
         self.unsupported_count = 0
         self.failed_files: list[tuple[str, str]] = []
+        self.duplicate_stats: dict[str, int] = {
+            "scanned": 0,
+            "hashed": 0,
+            "hash_remaining": 0,
+            "compared": 0,
+            "compare_remaining": 0,
+            "matching": 0,
+        }
         self.completed_operations = 0
         self.total_operations = 0
         self.total_files = 0
@@ -1659,8 +1683,9 @@ class MainWindow(QMainWindow):
         self.stop_requested = False
         self.is_paused = False
         self.is_running = False
+        self.current_job_kind: str | None = None
         self.worker_thread: QThread | None = None
-        self.worker: UploadWorker | None = None
+        self.worker: UploadWorker | DuplicateCheckWorker | None = None
         self.find_dialog: FindDialog | None = None
         self.current_log_path: Path | None = None
         self.connection_status_text = "Karakeep: Not configured"
@@ -1687,6 +1712,9 @@ class MainWindow(QMainWindow):
         self.upload_button = QPushButton("Configure Upload")
         self.upload_button.clicked.connect(lambda: self._open_upload_dialog())
 
+        self.duplicate_check_button = QPushButton("Check Duplicates")
+        self.duplicate_check_button.clicked.connect(self._confirm_duplicate_check)
+
         self.pause_button = QPushButton("Pause")
         self.pause_button.setEnabled(False)
         self.pause_button.clicked.connect(self._toggle_pause)
@@ -1709,6 +1737,7 @@ class MainWindow(QMainWindow):
         button_layout = QHBoxLayout()
         button_layout.addWidget(self.connection_settings_button)
         button_layout.addWidget(self.upload_button)
+        button_layout.addWidget(self.duplicate_check_button)
         button_layout.addSpacing(12)
         button_layout.addWidget(self.pause_button)
         button_layout.addWidget(self.stop_button)
@@ -1793,6 +1822,10 @@ class MainWindow(QMainWindow):
             lambda: self._open_upload_dialog()
         )
         file_menu.addAction(configure_upload_action)
+
+        check_duplicates_action = QAction("Check Duplicates", self)
+        check_duplicates_action.triggered.connect(self._confirm_duplicate_check)
+        file_menu.addAction(check_duplicates_action)
 
         pause_action = QAction("Pause / Unpause", self)
         pause_action.setShortcut("Ctrl+Space")
@@ -2252,6 +2285,7 @@ class MainWindow(QMainWindow):
         has_settings = self._has_connection_settings()
         self.connection_settings_button.setEnabled(not self.is_running)
         self.upload_button.setEnabled(has_settings and not self.is_running)
+        self.duplicate_check_button.setEnabled(has_settings and not self.is_running)
 
         if has_settings:
             server_url = str(
@@ -2375,6 +2409,123 @@ class MainWindow(QMainWindow):
         self.configuration = dialog.configuration
         self._start_upload_job()
 
+    def _confirm_duplicate_check(self) -> None:
+        if not self._has_connection_settings():
+            self._log("Configure Karakeep connection settings before checking duplicates.")
+            self._open_connection_settings()
+            return
+
+        response = QMessageBox.question(
+            self,
+            "Check Duplicates",
+            (
+                "This feature connects to the Karakeep server and highlights "
+                "possible duplicate bookmarks and media for review.\n\n"
+                "It compares the hash of each server asset, so it can take a "
+                "long time on large libraries. Exact media/file duplicates are "
+                "reliable; whole-bookmark duplicates only make sense as a "
+                "separate URL/text comparison and are not included in this "
+                "scan yet.\n\n"
+                "Start checking for duplicates?"
+            ),
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if response != QMessageBox.StandardButton.Ok:
+            self._log("Duplicate check canceled.")
+            return
+
+        self._start_duplicate_check_job()
+
+    def _start_duplicate_check_job(self) -> None:
+        server_url = str(
+            self.settings.value("connection/server_url", "") or ""
+        ).strip()
+
+        try:
+            api_key = (
+                keyring.get_password(KEYRING_SERVICE, KEYRING_USERNAME)
+                or ""
+            )
+        except keyring.errors.KeyringError as exc:
+            self._log(f"Unable to read API key: {exc}", level="ERROR")
+            return
+
+        self._log(
+            "================================",
+            message_color="START",
+            include_level=False,
+        )
+        self._log("STARTING DUPLICATE CHECK.", message_color="START")
+        self._log(
+            "================================",
+            message_color="START",
+            include_level=False,
+        )
+
+        self.configuration = None
+        self.current_index = 0
+        self.succeeded_count = 0
+        self.failed_count = 0
+        self.not_processed_count = 0
+        self.resolved_conflict_count = 0
+        self.unsupported_count = 0
+        self.failed_files = []
+        self.duplicate_stats = {
+            "scanned": 0,
+            "hashed": 0,
+            "hash_remaining": 0,
+            "compared": 0,
+            "compare_remaining": 0,
+            "matching": 0,
+        }
+        self.pending_dry_run_estimate_lines = []
+        self.completed_operations = 0
+        self.total_operations = 0
+        self.total_files = 0
+        self.job_started_at = time.monotonic()
+        self.stop_requested = False
+        self.is_paused = False
+        self.is_running = True
+        self.current_job_kind = "duplicates"
+
+        self.upload_button.setEnabled(False)
+        self.duplicate_check_button.setEnabled(False)
+        self.connection_settings_button.setEnabled(False)
+        self.pause_button.setEnabled(True)
+        self.pause_button.setText("Pause")
+        self.stop_button.setEnabled(True)
+        self.clear_console_button.setEnabled(False)
+
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.setValue(0)
+        self.current_file_label.setText("Current operation: preparing duplicate scan...")
+        self._update_summary()
+        self._log(f"Karakeep server: {server_url}")
+        self._log("Duplicate tags: POTENTIAL_DUPLICATE and PD: X")
+
+        job_config = DuplicateCheckConfig(
+            server_url=server_url,
+            api_key=api_key,
+        )
+
+        self.worker_thread = QThread(self)
+        self.worker = DuplicateCheckWorker(job_config)
+        self.worker.moveToThread(self.worker_thread)
+
+        self.worker_thread.started.connect(self.worker.run)
+        self.worker.log.connect(self._handle_worker_log)
+        self.worker.progress_range.connect(self._set_progress_range)
+        self.worker.progress.connect(self._set_progress)
+        self.worker.stats.connect(self._handle_duplicate_stats)
+        self.worker.finished.connect(self._finish_batch)
+        self.worker.finished.connect(self.worker_thread.quit)
+        self.worker.finished.connect(self.worker.deleteLater)
+        self.worker_thread.finished.connect(self.worker_thread.deleteLater)
+        self.worker_thread.finished.connect(self._clear_worker_references)
+
+        self.worker_thread.start()
+
     def _start_upload_job(self) -> None:
         config = self.configuration
         if config is None:
@@ -2438,8 +2589,10 @@ class MainWindow(QMainWindow):
         self.stop_requested = False
         self.is_paused = False
         self.is_running = True
+        self.current_job_kind = "upload"
 
         self.upload_button.setEnabled(False)
+        self.duplicate_check_button.setEnabled(False)
         self.connection_settings_button.setEnabled(False)
         self.pause_button.setEnabled(True)
         self.pause_button.setText("Pause")
@@ -2620,6 +2773,16 @@ class MainWindow(QMainWindow):
         self.unsupported_count = count
         self._update_summary()
 
+    def _handle_duplicate_stats(self, stats: object) -> None:
+        if not isinstance(stats, dict):
+            return
+
+        for key in self.duplicate_stats:
+            value = stats.get(key)
+            if isinstance(value, int):
+                self.duplicate_stats[key] = value
+        self._update_summary()
+
     def _set_progress_range(self, total_operations: int, total_files: int) -> None:
         self.total_operations = total_operations
         self.total_files = total_files
@@ -2652,21 +2815,22 @@ class MainWindow(QMainWindow):
 
         if self.is_paused:
             self.pause_button.setText("Unpause")
-            self.current_file_label.setText("Current file: paused")
+            self.current_file_label.setText("Current operation: paused")
             self._log(
-                "Pause requested. No new files will start until unpaused.",
+                "Pause requested. No new operations will start until unpaused.",
                 level="WARNING",
             )
         else:
             self.pause_button.setText("Pause")
-            self._log("Upload batch unpaused.")
+            self._log(f"{self._current_job_label()} unpaused.")
 
     def _request_stop(self) -> None:
         if not self.is_running:
             return
 
         if (
-            self.configuration is not None
+            self.current_job_kind == "upload"
+            and self.configuration is not None
             and not self.configuration.dry_run
             and self.configuration.dont_move_completed
             and not self._confirm_stop_with_completed_files_left_in_place()
@@ -2681,7 +2845,7 @@ class MainWindow(QMainWindow):
         self.stop_button.setEnabled(False)
         self.stop_button.setText("Stopping...")
         self._log(
-            "Stop requested. The batch will stop at "
+            "Stop requested. The current job will stop at "
             "the next safe checkpoint.",
             level="WARNING",
         )
@@ -2747,6 +2911,14 @@ class MainWindow(QMainWindow):
         self.resolved_conflict_count = 0
         self.unsupported_count = 0
         self.failed_files.clear()
+        self.duplicate_stats = {
+            "scanned": 0,
+            "hashed": 0,
+            "hash_remaining": 0,
+            "compared": 0,
+            "compare_remaining": 0,
+            "matching": 0,
+        }
         self.completed_operations = 0
         self.total_operations = 0
         self.total_files = 0
@@ -2754,6 +2926,7 @@ class MainWindow(QMainWindow):
         self.current_file_label.setText("Current file: -")
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
+        self.current_job_kind = None
         self.console.setExtraSelections([])
         self._update_summary()
         self._write_pending_finish_if_ready()
@@ -2788,7 +2961,18 @@ class MainWindow(QMainWindow):
         self.worker_thread = None
         self._write_pending_finish_if_ready()
 
+    def _current_job_label(self) -> str:
+        if self.current_job_kind == "duplicates":
+            return "Duplicate check"
+        if self.current_job_kind == "upload":
+            return "Upload batch"
+        return "Current job"
+
     def _update_summary(self) -> None:
+        if self.current_job_kind == "duplicates":
+            self._update_duplicate_summary()
+            return
+
         remaining = max(
             self.total_files - self.current_index,
             0,
@@ -2811,6 +2995,24 @@ class MainWindow(QMainWindow):
             "&nbsp;&nbsp;&nbsp;&nbsp;"
             f"Unsupported: {self._format_unsupported_count()}&nbsp;&nbsp;&nbsp;&nbsp;"
             f"Remaining: {remaining}&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"
+            f"<span style='color: {eta_color};'>ETA: {eta_text}</span>"
+        )
+
+    def _update_duplicate_summary(self) -> None:
+        colors = self._console_log_colors()
+        eta_text = self._format_eta()
+        eta_color = colors["timestamp"]
+        matching_text = self._format_warning_count(self.duplicate_stats["matching"])
+
+        self.summary_label.setText(
+            f"Scanned: {self.duplicate_stats['scanned']}&nbsp;&nbsp;&nbsp;&nbsp;"
+            f"Hashed: {self.duplicate_stats['hashed']}&nbsp;&nbsp;&nbsp;&nbsp;"
+            "Remaining to hash: "
+            f"{self.duplicate_stats['hash_remaining']}&nbsp;&nbsp;&nbsp;&nbsp;"
+            f"Compared: {self.duplicate_stats['compared']}&nbsp;&nbsp;&nbsp;&nbsp;"
+            "Remaining to compare: "
+            f"{self.duplicate_stats['compare_remaining']}&nbsp;&nbsp;&nbsp;&nbsp;"
+            f"Matching: {matching_text}&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"
             f"<span style='color: {eta_color};'>ETA: {eta_text}</span>"
         )
 
@@ -2868,6 +3070,16 @@ class MainWindow(QMainWindow):
         self,
         include_not_processed: bool = False,
     ) -> None:
+        if self.current_job_kind == "duplicates":
+            self._log(f"Potential duplicate groups: {self.succeeded_count}")
+            if self.failed_count > 0:
+                self._log(
+                    f"Duplicate check errors: {self.failed_count}",
+                    message_color="ERROR",
+                )
+            self._log_blank_lines(2)
+            return
+
         total = self.total_files
         self._log(f"Successful: {self.succeeded_count} / {total}")
 
@@ -2947,7 +3159,7 @@ class MainWindow(QMainWindow):
         if stopped:
             self.current_file_label.setText("Current file: stopped")
             self._log(
-                "UPLOAD BATCH STOPPED!",
+                f"{self._current_job_label().upper()} STOPPED!",
                 level="WARNING",
                 message_color="WARNING",
             )
@@ -2956,11 +3168,14 @@ class MainWindow(QMainWindow):
             self.clear_console_button.setEnabled(True)
         else:
             self.current_file_label.setText("Current file: complete")
-            complete_message = (
-                "DRY-RUN COMPLETE!"
-                if self.configuration is not None and self.configuration.dry_run
-                else "UPLOAD BATCH COMPLETE!"
-            )
+            if self.current_job_kind == "duplicates":
+                complete_message = "DUPLICATE CHECK COMPLETE!"
+            else:
+                complete_message = (
+                    "DRY-RUN COMPLETE!"
+                    if self.configuration is not None and self.configuration.dry_run
+                    else "UPLOAD BATCH COMPLETE!"
+                )
             self._log(
                 complete_message,
                 level="SUCCESS",
@@ -2969,6 +3184,8 @@ class MainWindow(QMainWindow):
             self._log(f"Total time: {self._format_total_elapsed_time()}")
             self._log_completion_summary()
             self.clear_console_button.setEnabled(True)
+
+        self.current_job_kind = None
 
     def _log(
         self,

@@ -32,6 +32,30 @@ class RecordingClient(KarakeepClient):
                 },
             )
 
+        if path == "/bookmarks" and method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "bookmarks": [
+                        {"id": "bookmark-1"},
+                        {"id": "bookmark-2"},
+                    ],
+                    "nextCursor": None,
+                },
+            )
+
+        if path == "/tags" and method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "tags": [
+                        {"id": "tag-1", "name": "POTENTIAL_DUPLICATE"},
+                        {"id": "tag-2", "name": "PD: 4"},
+                    ],
+                    "nextCursor": None,
+                },
+            )
+
         if path == "/bookmarks":
             return httpx.Response(
                 201,
@@ -155,6 +179,39 @@ class KarakeepClientTests(unittest.TestCase):
                 ]
             },
         )
+
+    def test_list_bookmarks_requests_content(self) -> None:
+        client = RecordingClient()
+
+        bookmarks = client.list_bookmarks(include_content=True)
+
+        self.assertEqual(
+            [bookmark["id"] for bookmark in bookmarks],
+            ["bookmark-1", "bookmark-2"],
+        )
+        self.assertIsNotNone(client.last_request)
+        self.assertEqual(client.last_request["method"], "GET")
+        self.assertEqual(client.last_request["path"], "/bookmarks")
+        self.assertEqual(
+            client.last_request["kwargs"]["params"],
+            {
+                "limit": 100,
+                "includeContent": True,
+            },
+        )
+
+    def test_list_tags_returns_tag_records(self) -> None:
+        client = RecordingClient()
+
+        tags = client.list_tags()
+
+        self.assertEqual(
+            [tag["name"] for tag in tags],
+            ["POTENTIAL_DUPLICATE", "PD: 4"],
+        )
+        self.assertIsNotNone(client.last_request)
+        self.assertEqual(client.last_request["method"], "GET")
+        self.assertEqual(client.last_request["path"], "/tags")
 
 
 if __name__ == "__main__":
