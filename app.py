@@ -1437,6 +1437,7 @@ class StatusConsole(QPlainTextEdit):
         super().__init__(parent)
 
         self._watermark = QPixmap(str(watermark_path))
+        self._visited_urls: set[str] = set()
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
         super().mousePressEvent(event)
@@ -1448,6 +1449,8 @@ class StatusConsole(QPlainTextEdit):
         block_text = cursor.block().text()
         clicked_url = self._url_at_cursor(block_text, cursor.positionInBlock())
         if clicked_url is not None:
+            self._visited_urls.add(clicked_url)
+            self._mark_url_visited(clicked_url)
             webbrowser.open(clicked_url)
             return
 
@@ -1461,6 +1464,27 @@ class StatusConsole(QPlainTextEdit):
             if match.start() <= position <= match.end():
                 return match.group(0).rstrip(".,);]")
         return None
+
+    def url_text_format(self, url: str) -> QTextCharFormat:
+        link_format = QTextCharFormat()
+        if url in self._visited_urls:
+            link_format.setForeground(QColor("#7e3ff2"))
+        else:
+            link_format.setForeground(QColor("#1a73e8"))
+        link_format.setFontUnderline(True)
+        return link_format
+
+    def _mark_url_visited(self, url: str) -> None:
+        cursor = QTextCursor(self.document())
+        visited_format = self.url_text_format(url)
+
+        while True:
+            cursor = self.document().find(url, cursor)
+            if cursor.isNull():
+                break
+            cursor.mergeCharFormat(visited_format)
+
+        self.viewport().update()
 
     def paintEvent(self, event) -> None:  # noqa: N802
         super().paintEvent(event)
@@ -3233,12 +3257,14 @@ class MainWindow(QMainWindow):
 
         if message.startswith("###### "):
             cursor.insertText("###### ", timestamp_format)
-            cursor.insertText(
+            self._insert_console_message_text(
+                cursor,
                 message.removeprefix("###### "),
                 message_format if message_color is not None else default_format,
             )
         else:
-            cursor.insertText(
+            self._insert_console_message_text(
+                cursor,
                 message,
                 message_format if message_color is not None else default_format,
             )
@@ -3252,6 +3278,28 @@ class MainWindow(QMainWindow):
         if should_auto_scroll:
             scrollbar = self.console.verticalScrollBar()
             scrollbar.setValue(scrollbar.maximum())
+
+    def _insert_console_message_text(
+        self,
+        cursor: QTextCursor,
+        message: str,
+        base_format: QTextCharFormat,
+    ) -> None:
+        position = 0
+        for match in re.finditer(r"https?://\S+", message):
+            if match.start() > position:
+                cursor.insertText(message[position:match.start()], base_format)
+
+            raw_url = match.group(0)
+            url = raw_url.rstrip(".,);]")
+            trailing = raw_url[len(url):]
+            cursor.insertText(url, self.console.url_text_format(url))
+            if trailing:
+                cursor.insertText(trailing, base_format)
+            position = match.end()
+
+        if position < len(message):
+            cursor.insertText(message[position:], base_format)
 
     def _console_should_auto_scroll(self) -> bool:
         scrollbar = self.console.verticalScrollBar()

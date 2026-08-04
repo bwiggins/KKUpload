@@ -201,7 +201,20 @@ class DuplicateScanner:
 
     @staticmethod
     def bookmark_url(server_url: str, bookmark_id: str) -> str:
-        return server_url.rstrip("/") + f"/dashboard/bookmarks/{bookmark_id}"
+        return server_url.rstrip("/") + f"/dashboard/preview/{bookmark_id}"
+
+    @staticmethod
+    def tag_url(server_url: str, tag_id: str) -> str:
+        return server_url.rstrip("/") + f"/dashboard/tags/{tag_id}"
+
+    def tag_ids_by_name(self) -> dict[str, str]:
+        tag_ids: dict[str, str] = {}
+        for tag in self.client.list_tags():
+            name = self._tag_name(tag)
+            tag_id = self._tag_id(tag)
+            if name is not None and tag_id is not None:
+                tag_ids[name.casefold()] = tag_id
+        return tag_ids
 
     @classmethod
     def _asset_bookmark_records(
@@ -306,6 +319,13 @@ class DuplicateScanner:
         return None
 
     @staticmethod
+    def _tag_id(tag: dict) -> str | None:
+        value = tag.get("id") or tag.get("tagId")
+        if value is None:
+            return None
+        return str(value)
+
+    @staticmethod
     def _next_available_number(existing_numbers: set[int], start: int) -> int:
         value = start
         while value in existing_numbers:
@@ -396,12 +416,25 @@ class DuplicateCheckWorker(QObject):
                 self.finished.emit(True, 0, 0, 0)
                 return
 
+            tag_ids = scanner.tag_ids_by_name()
             self._log("================================", level="")
             self._log("Potential duplicate groups:", message_color="WARNING")
             for group in groups:
+                pd_tag = f"{PD_TAG_PREFIX}{group.group_number}"
+                pd_tag_id = tag_ids.get(pd_tag.casefold())
+                tag_link = (
+                    DuplicateScanner.tag_url(client.server_url, pd_tag_id)
+                    if pd_tag_id is not None
+                    else "(tag link unavailable)"
+                )
                 self._log(
-                    f"Group PD: {group.group_number} "
-                    f"({len(group.matches)} matches, sha256 {group.digest})",
+                    "--------------------------------",
+                    level="",
+                    message_color="WARNING",
+                )
+                self._log(
+                    f"Group {pd_tag} | {tag_link} | "
+                    f"{len(group.matches)} matches | sha256 {group.digest}",
                     message_color="WARNING",
                 )
                 for match in group.matches:

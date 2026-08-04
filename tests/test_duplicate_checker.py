@@ -45,6 +45,7 @@ class FakeDuplicateClient:
         return (
             {"name": "PD: 1"},
             {"name": "PD: 2"},
+            {"id": "tag-99", "name": "PD: 99"},
             {"name": "other"},
         )
 
@@ -105,6 +106,24 @@ class DuplicateScannerTests(unittest.TestCase):
                 ("bookmark-1", (POTENTIAL_DUPLICATE_TAG, "PD: 3")),
                 ("bookmark-3", (POTENTIAL_DUPLICATE_TAG, "PD: 3")),
             ],
+        )
+
+    def test_bookmark_url_uses_karakeep_preview_route(self) -> None:
+        self.assertEqual(
+            DuplicateScanner.bookmark_url(
+                "https://karakeep.example.test/",
+                "bookmark-1",
+            ),
+            "https://karakeep.example.test/dashboard/preview/bookmark-1",
+        )
+
+    def test_tag_ids_and_tag_url_use_dashboard_tag_route(self) -> None:
+        scanner = DuplicateScanner(FakeDuplicateClient())
+
+        self.assertEqual(scanner.tag_ids_by_name()["pd: 99"], "tag-99")
+        self.assertEqual(
+            DuplicateScanner.tag_url("https://karakeep.example.test", "tag-99"),
+            "https://karakeep.example.test/dashboard/tags/tag-99",
         )
 
 
