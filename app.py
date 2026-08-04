@@ -3003,15 +3003,21 @@ class MainWindow(QMainWindow):
         eta_text = self._format_eta()
         eta_color = colors["timestamp"]
         matching_text = self._format_warning_count(self.duplicate_stats["matching"])
+        total_hashable = (
+            self.duplicate_stats["hashed"]
+            + self.duplicate_stats["hash_remaining"]
+        )
+        total_comparable = (
+            self.duplicate_stats["compared"]
+            + self.duplicate_stats["compare_remaining"]
+        )
 
         self.summary_label.setText(
             f"Scanned: {self.duplicate_stats['scanned']}&nbsp;&nbsp;&nbsp;&nbsp;"
-            f"Hashed: {self.duplicate_stats['hashed']}&nbsp;&nbsp;&nbsp;&nbsp;"
-            "Remaining to hash: "
-            f"{self.duplicate_stats['hash_remaining']}&nbsp;&nbsp;&nbsp;&nbsp;"
-            f"Compared: {self.duplicate_stats['compared']}&nbsp;&nbsp;&nbsp;&nbsp;"
-            "Remaining to compare: "
-            f"{self.duplicate_stats['compare_remaining']}&nbsp;&nbsp;&nbsp;&nbsp;"
+            f"Hashed: {self.duplicate_stats['hashed']} / {total_hashable}"
+            "&nbsp;&nbsp;&nbsp;&nbsp;"
+            f"Compared: {self.duplicate_stats['compared']} / {total_comparable}"
+            "&nbsp;&nbsp;&nbsp;&nbsp;"
             f"Matching: {matching_text}&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"
             f"<span style='color: {eta_color};'>ETA: {eta_text}</span>"
         )
