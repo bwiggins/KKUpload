@@ -47,6 +47,7 @@ class DuplicateCheckConfig:
     server_url: str
     api_key: str
     rescan: bool = True
+    aggressive_duplicate_clearing: bool = False
     replicate_lists: bool = False
     replicate_tags: bool = False
     auto_cull: bool = False
@@ -89,6 +90,14 @@ class DuplicateCheckClientProtocol(Protocol):
         ...
 
     def get_bookmark_lists(self, bookmark_id: str) -> tuple:
+        ...
+
+    def update_bookmark_note(
+        self,
+        *,
+        bookmark_id: str,
+        note: str,
+    ) -> dict:
         ...
 
     def add_bookmark_to_list(self, *, list_id: str, bookmark_id: str) -> None:
@@ -316,6 +325,7 @@ class DuplicateScanner:
         self,
         groups: tuple[DuplicateGroup, ...],
         *,
+        aggressive_duplicate_clearing: bool,
         replicate_lists: bool,
         replicate_tags: bool,
         auto_cull: bool,
@@ -372,22 +382,44 @@ class DuplicateScanner:
                     progress("cleanup", len(results), total_groups)
                 continue
 
-            if replicate_lists:
-                self._replicate_lists(details, log=log, checkpoint=checkpoint)
-
-            if replicate_tags:
-                self._replicate_tags(details, log=log, checkpoint=checkpoint)
-
-            remaining_ids = tuple(details)
-            deleted_count = 0
-            if auto_cull:
-                remaining_ids, deleted_count = self._auto_cull_group(
+            if aggressive_duplicate_clearing:
+                remaining_ids, deleted_count = self._aggressive_clear_group(
+                    group,
                     details,
                     log=log,
                     checkpoint=checkpoint,
                 )
+            elif replicate_lists:
+                self._replicate_lists(details, log=log, checkpoint=checkpoint)
+                if replicate_tags:
+                    self._replicate_tags(details, log=log, checkpoint=checkpoint)
 
-            if cleanup_resolved_duplicate_tags and len(remaining_ids) <= 1:
+                remaining_ids = tuple(details)
+                deleted_count = 0
+                if auto_cull:
+                    remaining_ids, deleted_count = self._auto_cull_group(
+                        details,
+                        log=log,
+                        checkpoint=checkpoint,
+                    )
+            else:
+                if replicate_tags:
+                    self._replicate_tags(details, log=log, checkpoint=checkpoint)
+
+                remaining_ids = tuple(details)
+                deleted_count = 0
+                if auto_cull:
+                    remaining_ids, deleted_count = self._auto_cull_group(
+                        details,
+                        log=log,
+                        checkpoint=checkpoint,
+                    )
+
+            if (
+                cleanup_resolved_duplicate_tags
+                and not aggressive_duplicate_clearing
+                and len(remaining_ids) <= 1
+            ):
                 pd_tag_id = group.pd_tag_id
                 if pd_tag_id is None:
                     if pd_tag_ids_by_name is None:
@@ -464,6 +496,201 @@ class DuplicateScanner:
                 "tag_sources": self._extract_tag_sources(bookmark),
             }
         return details, error_count
+
+    def _aggressive_clear_group(
+        self,
+        group: DuplicateGroup,
+        details: dict[str, dict],
+        *,
+        log,
+        checkpoint,
+    ) -> tuple[tuple[str, ...], int]:
+        ordered_ids = tuple(
+            bookmark_id
+            for bookmark_id in self._unique_bookmark_ids(group)
+            if bookmark_id in details
+        )
+        if not ordered_ids:
+            return (), 0
+
+        keeper_id = ordered_ids[0]
+        delete_ids = ordered_ids[1:]
+        log(
+            f"Aggressive clearing group PD: {group.group_number}: "
+            f"keeping {keeper_id}, removing {len(delete_ids)} duplicate bookmark(s)."
+        )
+
+        self._copy_lists_to_bookmark(
+            keeper_id,
+            details,
+            log=log,
+            checkpoint=checkpoint,
+        )
+        self._copy_tags_to_bookmark(
+            keeper_id,
+            details,
+            log=log,
+            checkpoint=checkpoint,
+        )
+
+        note_text = self._duplicate_title_note(keeper_id, ordered_ids, details)
+        log(f"Writing duplicate title list to bookmark note {keeper_id}.")
+        self._try_bookmark_operation(
+            f"write duplicate title list to bookmark note {keeper_id}",
+            bookmark_id=keeper_id,
+            operation=lambda keeper_id=keeper_id, note_text=note_text: (
+                self.client.update_bookmark_note(
+                    bookmark_id=keeper_id,
+                    note=note_text,
+                )
+            ),
+            log=log,
+            checkpoint=checkpoint,
+        )
+
+        deleted_ids: set[str] = set()
+        for bookmark_id in delete_ids:
+            checkpoint()
+            log(
+                f"Aggressive clearing: deleting duplicate bookmark {bookmark_id}; "
+                f"kept bookmark {keeper_id}."
+            )
+            deleted = self._try_bookmark_operation(
+                f"delete aggressive duplicate bookmark {bookmark_id}",
+                bookmark_id=bookmark_id,
+                operation=lambda bookmark_id=bookmark_id: self.client.delete_bookmark(
+                    bookmark_id
+                ),
+                log=log,
+                checkpoint=checkpoint,
+            )
+            if deleted is not None:
+                deleted_ids.add(bookmark_id)
+
+        if len(deleted_ids) == len(delete_ids) and group.pd_tag_id is not None:
+            self._cleanup_resolved_duplicate_tags(
+                (keeper_id,),
+                f"{PD_TAG_PREFIX}{group.group_number}",
+                group.pd_tag_id,
+                log=log,
+                checkpoint=checkpoint,
+            )
+
+        return (keeper_id,), len(deleted_ids)
+
+    def _copy_lists_to_bookmark(
+        self,
+        keeper_id: str,
+        details: dict[str, dict],
+        *,
+        log,
+        checkpoint,
+    ) -> None:
+        keeper_detail = details[keeper_id]
+        keeper_list_ids = {record.id for record in keeper_detail["lists"]}
+        all_lists = {
+            record.id: record
+            for detail in details.values()
+            for record in detail["lists"]
+        }
+        for list_id, record in sorted(all_lists.items(), key=lambda item: item[1].name):
+            if list_id in keeper_list_ids:
+                continue
+            checkpoint()
+            log(f"Copying list '{record.name}' to kept bookmark {keeper_id}.")
+            added = self._try_bookmark_operation(
+                f"copy list '{record.name}' to kept bookmark {keeper_id}",
+                bookmark_id=keeper_id,
+                operation=lambda list_id=list_id, keeper_id=keeper_id: (
+                    self.client.add_bookmark_to_list(
+                        list_id=list_id,
+                        bookmark_id=keeper_id,
+                    )
+                ),
+                log=log,
+                checkpoint=checkpoint,
+            )
+            if added is not None:
+                keeper_detail["lists"] = tuple((*keeper_detail["lists"], record))
+                keeper_list_ids.add(list_id)
+
+    def _copy_tags_to_bookmark(
+        self,
+        keeper_id: str,
+        details: dict[str, dict],
+        *,
+        log,
+        checkpoint,
+    ) -> None:
+        keeper_detail = details[keeper_id]
+        keeper_tags = {tag.casefold() for tag in keeper_detail["tags"]}
+        all_tags = sorted({
+            tag
+            for detail in details.values()
+            for tag in detail["tags"]
+            if not self._is_duplicate_bookkeeping_tag(tag)
+        })
+        missing = tuple(tag for tag in all_tags if tag.casefold() not in keeper_tags)
+        if not missing:
+            return
+
+        missing_by_source: dict[str, list[str]] = defaultdict(list)
+        for tag in missing:
+            missing_by_source[self._source_for_tag(details, tag)].append(tag)
+
+        for attached_by, tag_names in sorted(missing_by_source.items()):
+            tag_tuple = tuple(tag_names)
+            checkpoint()
+            log(
+                f"Copying {attached_by} tags to kept bookmark {keeper_id}: "
+                f"{', '.join(tag_tuple)}."
+            )
+            attached = self._try_bookmark_operation(
+                f"copy tags to kept bookmark {keeper_id}",
+                bookmark_id=keeper_id,
+                operation=(
+                    lambda keeper_id=keeper_id,
+                    tag_tuple=tag_tuple,
+                    attached_by=attached_by: self.client.attach_tags_to_bookmark(
+                        bookmark_id=keeper_id,
+                        tag_names=tag_tuple,
+                        attached_by=attached_by,
+                    )
+                ),
+                log=log,
+                checkpoint=checkpoint,
+            )
+            if attached is not None:
+                keeper_detail["tags"] = tuple((*keeper_detail["tags"], *tag_tuple))
+                tag_sources = dict(keeper_detail["tag_sources"])
+                for tag in tag_tuple:
+                    tag_sources[tag.casefold()] = attached_by
+                keeper_detail["tag_sources"] = tag_sources
+                keeper_tags.update(tag.casefold() for tag in tag_tuple)
+
+    @classmethod
+    def _duplicate_title_note(
+        cls,
+        keeper_id: str,
+        ordered_ids: tuple[str, ...],
+        details: dict[str, dict],
+    ) -> str:
+        existing_note = cls._bookmark_note(details[keeper_id]["bookmark"]).strip()
+        titles = [
+            cls._bookmark_title(details[bookmark_id]["bookmark"])
+            for bookmark_id in ordered_ids
+        ]
+        title_block = "DUPLICATE TITLES:\n" + "\n".join(titles)
+        if not existing_note:
+            return title_block
+        return f"{existing_note}\n\n{title_block}"
+
+    @staticmethod
+    def _bookmark_note(bookmark: dict) -> str:
+        value = bookmark.get("note")
+        if value is None:
+            return ""
+        return str(value)
 
     def _replicate_lists(self, details: dict[str, dict], *, log, checkpoint) -> None:
         all_lists = {
@@ -1002,12 +1229,18 @@ class DuplicateCheckWorker(QObject):
                     level="WARNING",
                     message_color="WARNING",
                 )
-                scanner.tag_duplicate_groups(
-                    groups,
-                    log=self._log,
-                    checkpoint=self._checkpoint,
-                    progress=self._handle_tag_progress,
-                )
+                if self.config.aggressive_duplicate_clearing:
+                    self._log(
+                        "Aggressive duplicate clearing selected; "
+                        "skipping duplicate review tag application."
+                    )
+                else:
+                    scanner.tag_duplicate_groups(
+                        groups,
+                        log=self._log,
+                        checkpoint=self._checkpoint,
+                        progress=self._handle_tag_progress,
+                    )
             else:
                 self._log("Skipping full hash rescan by request.")
                 groups = scanner.existing_duplicate_groups(
@@ -1030,6 +1263,7 @@ class DuplicateCheckWorker(QObject):
                 or self.config.replicate_tags
                 or self.config.auto_cull
                 or self.config.cleanup_resolved_duplicate_tags
+                or self.config.aggressive_duplicate_clearing
             ):
                 self._log("Starting duplicate cleanup options.")
                 self._cleanup_total_groups = len(groups)
@@ -1039,6 +1273,9 @@ class DuplicateCheckWorker(QObject):
                 self._emit_stats()
                 scanner.cleanup_duplicate_groups(
                     groups,
+                    aggressive_duplicate_clearing=(
+                        self.config.aggressive_duplicate_clearing
+                    ),
                     replicate_lists=self.config.replicate_lists,
                     replicate_tags=self.config.replicate_tags,
                     auto_cull=self.config.auto_cull,

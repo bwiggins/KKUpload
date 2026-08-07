@@ -68,6 +68,15 @@ class RecordingClient(KarakeepClient):
         if method == "DELETE":
             return httpx.Response(204)
 
+        if method == "PATCH" and path.startswith("/bookmarks/"):
+            return httpx.Response(
+                200,
+                json={
+                    "id": path.rsplit("/", 1)[-1],
+                    **kwargs["json"],
+                },
+            )
+
         if path == "/bookmarks":
             return httpx.Response(
                 201,
@@ -263,6 +272,22 @@ class KarakeepClientTests(unittest.TestCase):
         self.assertIsNotNone(client.last_request)
         self.assertEqual(client.last_request["method"], "DELETE")
         self.assertEqual(client.last_request["path"], "/bookmarks/bookmark-1")
+
+    def test_update_bookmark_note_uses_patch_endpoint(self) -> None:
+        client = RecordingClient()
+
+        client.update_bookmark_note(
+            bookmark_id="bookmark-1",
+            note="DUPLICATE TITLES:\nFirst\nSecond",
+        )
+
+        self.assertIsNotNone(client.last_request)
+        self.assertEqual(client.last_request["method"], "PATCH")
+        self.assertEqual(client.last_request["path"], "/bookmarks/bookmark-1")
+        self.assertEqual(
+            client.last_request["kwargs"]["json"],
+            {"note": "DUPLICATE TITLES:\nFirst\nSecond"},
+        )
 
     def test_delete_tag_uses_tag_endpoint(self) -> None:
         client = RecordingClient()

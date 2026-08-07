@@ -22,6 +22,7 @@ class FakeDuplicateClient:
         self.added_lists: list[tuple[str, str]] = []
         self.deleted_bookmarks: list[str] = []
         self.deleted_tags: list[str] = []
+        self.updated_notes: list[tuple[str, str]] = []
         self.list_tags_calls = 0
         self.assets = {
             "asset-1": b"same",
@@ -101,6 +102,16 @@ class FakeDuplicateClient:
 
     def get_bookmark_lists(self, bookmark_id: str) -> tuple[ListRecord, ...]:
         return tuple(self.bookmark_lists[bookmark_id])
+
+    def update_bookmark_note(
+        self,
+        *,
+        bookmark_id: str,
+        note: str,
+    ) -> dict:
+        self.updated_notes.append((bookmark_id, note))
+        self.bookmarks[bookmark_id]["note"] = note
+        return self.bookmarks[bookmark_id]
 
     def add_bookmark_to_list(self, *, list_id: str, bookmark_id: str) -> None:
         self.added_lists.append((bookmark_id, list_id))
@@ -275,6 +286,7 @@ class DuplicateScannerTests(unittest.TestCase):
 
         scanner.cleanup_duplicate_groups(
             groups,
+            aggressive_duplicate_clearing=False,
             replicate_lists=True,
             replicate_tags=True,
             auto_cull=False,
@@ -303,6 +315,7 @@ class DuplicateScannerTests(unittest.TestCase):
 
         scanner.cleanup_duplicate_groups(
             groups,
+            aggressive_duplicate_clearing=False,
             replicate_lists=False,
             replicate_tags=True,
             auto_cull=False,
@@ -312,6 +325,76 @@ class DuplicateScannerTests(unittest.TestCase):
         )
 
         self.assertIn(("bookmark-1", ("ai-photo",), "ai"), client.attached_tags)
+
+    def test_cleanup_aggressive_keeps_first_copies_metadata_and_deletes_others(self) -> None:
+        client = FakeDuplicateClient()
+        scanner = DuplicateScanner(client)
+        group = DuplicateGroup(
+            group_number=3,
+            digest="same",
+            matches=(
+                BookmarkAssetFingerprint("bookmark-1", "First", "asset-1", "same"),
+                BookmarkAssetFingerprint("bookmark-3", "Third", "asset-3", "same"),
+            ),
+            pd_tag_id="tag-3",
+        )
+        client.bookmarks["bookmark-3"]["title"] = "Third"
+        client.bookmarks["bookmark-1"]["note"] = "Existing note."
+
+        results = scanner.cleanup_duplicate_groups(
+            (group,),
+            aggressive_duplicate_clearing=True,
+            replicate_lists=False,
+            replicate_tags=False,
+            auto_cull=False,
+            cleanup_resolved_duplicate_tags=False,
+            log=lambda _message, **_kwargs: None,
+            checkpoint=lambda: None,
+        )
+
+        self.assertEqual(results[0].deleted_count, 1)
+        self.assertEqual(results[0].remaining_count, 1)
+        self.assertEqual(client.deleted_bookmarks, ["bookmark-3"])
+        self.assertIn(("bookmark-1", "list-2"), client.added_lists)
+        self.assertIn(("bookmark-1", ("photo",), "human"), client.attached_tags)
+        self.assertEqual(
+            client.updated_notes,
+            [("bookmark-1", "Existing note.\n\nDUPLICATE TITLES:\nFirst\nThird")],
+        )
+        self.assertEqual(
+            client.detached_tags,
+            [("bookmark-1", ("POTENTIAL_DUPLICATE",))],
+        )
+        self.assertEqual(client.deleted_tags, ["tag-3"])
+
+    def test_cleanup_aggressive_writes_title_note_without_existing_note(self) -> None:
+        client = FakeDuplicateClient()
+        scanner = DuplicateScanner(client)
+        group = DuplicateGroup(
+            group_number=3,
+            digest="same",
+            matches=(
+                BookmarkAssetFingerprint("bookmark-1", "First", "asset-1", "same"),
+                BookmarkAssetFingerprint("bookmark-3", "Third", "asset-3", "same"),
+            ),
+        )
+        client.bookmarks["bookmark-3"]["title"] = "Third"
+
+        scanner.cleanup_duplicate_groups(
+            (group,),
+            aggressive_duplicate_clearing=True,
+            replicate_lists=False,
+            replicate_tags=False,
+            auto_cull=False,
+            cleanup_resolved_duplicate_tags=False,
+            log=lambda _message, **_kwargs: None,
+            checkpoint=lambda: None,
+        )
+
+        self.assertEqual(
+            client.updated_notes,
+            [("bookmark-1", "DUPLICATE TITLES:\nFirst\nThird")],
+        )
 
     def test_cleanup_auto_culls_repeated_signature_and_removes_tags_from_single(self) -> None:
         client = FakeDuplicateClient()
@@ -332,6 +415,7 @@ class DuplicateScannerTests(unittest.TestCase):
 
         scanner.cleanup_duplicate_groups(
             (group,),
+            aggressive_duplicate_clearing=False,
             replicate_lists=False,
             replicate_tags=False,
             auto_cull=True,
@@ -361,6 +445,7 @@ class DuplicateScannerTests(unittest.TestCase):
 
         results = scanner.cleanup_duplicate_groups(
             (group,),
+            aggressive_duplicate_clearing=False,
             replicate_lists=False,
             replicate_tags=False,
             auto_cull=True,
@@ -389,6 +474,7 @@ class DuplicateScannerTests(unittest.TestCase):
 
         scanner.cleanup_duplicate_groups(
             (group,),
+            aggressive_duplicate_clearing=False,
             replicate_lists=False,
             replicate_tags=False,
             auto_cull=False,
@@ -408,6 +494,7 @@ class DuplicateScannerTests(unittest.TestCase):
 
         scanner.cleanup_duplicate_groups(
             (group,),
+            aggressive_duplicate_clearing=False,
             replicate_lists=False,
             replicate_tags=False,
             auto_cull=False,
@@ -441,6 +528,7 @@ class DuplicateScannerTests(unittest.TestCase):
 
         scanner.cleanup_duplicate_groups(
             groups,
+            aggressive_duplicate_clearing=False,
             replicate_lists=False,
             replicate_tags=False,
             auto_cull=False,

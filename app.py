@@ -99,6 +99,7 @@ class UploadConfiguration:
 @dataclass(frozen=True)
 class DuplicateCheckOptions:
     rescan: bool
+    aggressive_duplicate_clearing: bool
     replicate_lists: bool
     replicate_tags: bool
     auto_cull: bool
@@ -130,19 +131,28 @@ class DuplicateCheckDialog(QDialog):
         self.rescan_checkbox = QCheckBox("Rescan all server assets")
         self.rescan_checkbox.setChecked(True)
 
+        self.aggressive_duplicate_clearing_checkbox = QCheckBox(
+            "Aggressive Duplicate Clearing"
+        )
         self.replicate_lists_checkbox = QCheckBox(
             "Union all lists across each duplicate group"
         )
+        self.replicate_lists_checkbox.setChecked(True)
         self.replicate_tags_checkbox = QCheckBox(
             "Union all tags across each duplicate group"
         )
+        self.replicate_tags_checkbox.setChecked(True)
         self.auto_cull_checkbox = QCheckBox(
             "Cull redundant duplicates after cleanup"
         )
+        self.auto_cull_checkbox.setChecked(True)
         self.cleanup_resolved_tags_checkbox = QCheckBox(
             "Clean up resolved duplicate tags"
         )
         self.cleanup_resolved_tags_checkbox.setChecked(True)
+        self.aggressive_duplicate_clearing_checkbox.toggled.connect(
+            self._update_cleanup_option_state
+        )
 
         auto_cull_note = QLabel(
             "Culling keeps one bookmark for each unique combination of name, "
@@ -160,27 +170,46 @@ class DuplicateCheckDialog(QDialog):
         self.button_box.accepted.connect(self._accept_options)
         self.button_box.rejected.connect(self.reject)
 
+        self.cleanup_group = QGroupBox("Custom cleanup")
+        cleanup_layout = QVBoxLayout(self.cleanup_group)
+        cleanup_layout.addWidget(self.replicate_lists_checkbox)
+        cleanup_layout.addWidget(self.replicate_tags_checkbox)
+        cleanup_layout.addWidget(self.auto_cull_checkbox)
+        cleanup_layout.addWidget(self.cleanup_resolved_tags_checkbox)
+        cleanup_layout.addWidget(auto_cull_note)
+
         layout = QVBoxLayout(self)
         layout.addWidget(message)
         layout.addSpacing(8)
         layout.addWidget(self.rescan_checkbox)
         layout.addWidget(scan_warning)
         layout.addSpacing(8)
-        layout.addWidget(self.replicate_lists_checkbox)
-        layout.addWidget(self.replicate_tags_checkbox)
-        layout.addWidget(self.auto_cull_checkbox)
-        layout.addWidget(self.cleanup_resolved_tags_checkbox)
-        layout.addWidget(auto_cull_note)
+        layout.addWidget(self.aggressive_duplicate_clearing_checkbox)
+        layout.addWidget(self.cleanup_group)
         layout.addWidget(self.button_box)
+        self._update_cleanup_option_state(
+            self.aggressive_duplicate_clearing_checkbox.isChecked()
+        )
+
+    def _update_cleanup_option_state(self, aggressive: bool) -> None:
+        self.cleanup_group.setEnabled(not aggressive)
 
     def _accept_options(self) -> None:
+        aggressive = self.aggressive_duplicate_clearing_checkbox.isChecked()
         self.options = DuplicateCheckOptions(
             rescan=self.rescan_checkbox.isChecked(),
-            replicate_lists=self.replicate_lists_checkbox.isChecked(),
-            replicate_tags=self.replicate_tags_checkbox.isChecked(),
-            auto_cull=self.auto_cull_checkbox.isChecked(),
+            aggressive_duplicate_clearing=aggressive,
+            replicate_lists=(
+                False if aggressive else self.replicate_lists_checkbox.isChecked()
+            ),
+            replicate_tags=(
+                False if aggressive else self.replicate_tags_checkbox.isChecked()
+            ),
+            auto_cull=False if aggressive else self.auto_cull_checkbox.isChecked(),
             cleanup_resolved_duplicate_tags=(
-                self.cleanup_resolved_tags_checkbox.isChecked()
+                False
+                if aggressive
+                else self.cleanup_resolved_tags_checkbox.isChecked()
             ),
         )
         self.accept()
@@ -2609,6 +2638,8 @@ class MainWindow(QMainWindow):
         self._log(
             "Duplicate options: "
             f"rescan={'yes' if options.rescan else 'no'}, "
+            "aggressive clearing="
+            f"{'yes' if options.aggressive_duplicate_clearing else 'no'}, "
             f"union lists={'yes' if options.replicate_lists else 'no'}, "
             f"union tags={'yes' if options.replicate_tags else 'no'}, "
             f"cull redundant={'yes' if options.auto_cull else 'no'}, "
@@ -2620,6 +2651,7 @@ class MainWindow(QMainWindow):
             server_url=server_url,
             api_key=api_key,
             rescan=options.rescan,
+            aggressive_duplicate_clearing=options.aggressive_duplicate_clearing,
             replicate_lists=options.replicate_lists,
             replicate_tags=options.replicate_tags,
             auto_cull=options.auto_cull,

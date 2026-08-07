@@ -199,6 +199,19 @@ class KarakeepClient:
             return tuple(self._parse_list(item) for item in data)
         return tuple(self._parse_list(item) for item in data.get("lists", []))
 
+    def update_bookmark_note(
+        self,
+        *,
+        bookmark_id: str,
+        note: str,
+    ) -> dict[str, Any]:
+        response = self._request(
+            "PATCH",
+            f"/bookmarks/{bookmark_id}",
+            json={"note": note},
+        )
+        return response.json()
+
     def delete_bookmark(self, bookmark_id: str) -> None:
         self._request("DELETE", f"/bookmarks/{bookmark_id}")
 
