@@ -152,6 +152,13 @@ class FlakyExistingGroupClient(FakeDuplicateClient):
         )
 
 
+class FailingTagListClient(FakeDuplicateClient):
+    def list_tags(self) -> tuple[dict, ...]:
+        self.list_tags_calls += 1
+        request = httpx.Request("GET", "https://karakeep.example.test")
+        raise httpx.ConnectError("[WinError 10053] connection aborted", request=request)
+
+
 class DuplicateScannerTests(unittest.TestCase):
     def test_find_duplicate_groups_uses_unused_pd_number(self) -> None:
         client = FakeDuplicateClient()
@@ -236,6 +243,26 @@ class DuplicateScannerTests(unittest.TestCase):
                 for message in log_messages
             )
         )
+
+    def test_existing_duplicate_groups_returns_empty_when_tag_list_fails(self) -> None:
+        client = FailingTagListClient()
+        scanner = DuplicateScanner(client)
+        log_messages: list[str] = []
+
+        groups = scanner.existing_duplicate_groups(
+            log=lambda message, **_kwargs: log_messages.append(message),
+            checkpoint=lambda: None,
+        )
+
+        self.assertEqual(groups, ())
+        self.assertEqual(client.list_tags_calls, 3)
+        self.assertTrue(
+            any(
+                "Could not retrieve existing PD tag list" in message
+                for message in log_messages
+            )
+        )
+
 
     def test_cleanup_replicates_lists_and_tags(self) -> None:
         client = FakeDuplicateClient()

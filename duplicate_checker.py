@@ -253,7 +253,21 @@ class DuplicateScanner:
         log,
         checkpoint,
     ) -> tuple[DuplicateGroup, ...]:
-        tag_ids = self.tag_ids_by_name()
+        tag_ids = self._try_tag_operation(
+            "retrieve existing PD tag list",
+            tag_id="tags",
+            operation=self.tag_ids_by_name,
+            log=log,
+            checkpoint=checkpoint,
+        )
+        if tag_ids is None:
+            log(
+                "Could not retrieve existing PD tag list after repeated "
+                "failures. No existing duplicate groups can be loaded.",
+                level="ERROR",
+                message_color="ERROR",
+            )
+            return ()
         groups: list[DuplicateGroup] = []
 
         for tag_name, tag_id in sorted(tag_ids.items()):

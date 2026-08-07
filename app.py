@@ -3282,6 +3282,8 @@ class MainWindow(QMainWindow):
         self.pending_finish_stopped = None
 
         if stopped:
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(0)
             self.current_file_label.setText("Current file: stopped")
             self._log(
                 f"{self._current_job_label().upper()} STOPPED!",
@@ -3292,6 +3294,8 @@ class MainWindow(QMainWindow):
             self._log_completion_summary(include_not_processed=True)
             self.clear_console_button.setEnabled(True)
         else:
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(100)
             self.current_file_label.setText("Current file: complete")
             if self.current_job_kind == "duplicates":
                 complete_message = "DUPLICATE CHECK COMPLETE!"
