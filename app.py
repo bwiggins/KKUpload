@@ -96,6 +96,96 @@ class UploadConfiguration:
     dry_run: bool
 
 
+@dataclass(frozen=True)
+class DuplicateCheckOptions:
+    rescan: bool
+    replicate_lists: bool
+    replicate_tags: bool
+    auto_cull: bool
+    cleanup_resolved_duplicate_tags: bool
+
+
+class DuplicateCheckDialog(QDialog):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.options: DuplicateCheckOptions | None = None
+
+        self.setWindowTitle("Check Duplicates")
+        self.setMinimumWidth(560)
+
+        message = QLabel(
+            "Duplicate maintenance connects to the Karakeep server and can "
+            "highlight possible duplicate bookmarks and media for review."
+        )
+        message.setWordWrap(True)
+
+        scan_warning = QLabel(
+            "Rescanning downloads and hashes every server asset, which is "
+            "extremely time consuming on large libraries. Skip rescan to use "
+            "the existing POTENTIAL_DUPLICATE and PD: X groups already on the "
+            "server."
+        )
+        scan_warning.setWordWrap(True)
+
+        self.rescan_checkbox = QCheckBox("Rescan all server assets")
+        self.rescan_checkbox.setChecked(True)
+
+        self.replicate_lists_checkbox = QCheckBox(
+            "Union all lists across each duplicate group"
+        )
+        self.replicate_tags_checkbox = QCheckBox(
+            "Union all tags across each duplicate group"
+        )
+        self.auto_cull_checkbox = QCheckBox(
+            "Cull redundant duplicates after cleanup"
+        )
+        self.cleanup_resolved_tags_checkbox = QCheckBox(
+            "Clean up resolved duplicate tags"
+        )
+        self.cleanup_resolved_tags_checkbox.setChecked(True)
+
+        auto_cull_note = QLabel(
+            "Culling keeps one bookmark for each unique combination of name, "
+            "description, lists, and tags, and removes only redundant repeats. "
+            "Resolved tag cleanup deletes the PD: X tag for groups with one "
+            "or fewer bookmarks and removes POTENTIAL_DUPLICATE from any "
+            "remaining bookmark."
+        )
+        auto_cull_note.setWordWrap(True)
+
+        self.button_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Cancel
+            | QDialogButtonBox.StandardButton.Ok
+        )
+        self.button_box.accepted.connect(self._accept_options)
+        self.button_box.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(message)
+        layout.addSpacing(8)
+        layout.addWidget(self.rescan_checkbox)
+        layout.addWidget(scan_warning)
+        layout.addSpacing(8)
+        layout.addWidget(self.replicate_lists_checkbox)
+        layout.addWidget(self.replicate_tags_checkbox)
+        layout.addWidget(self.auto_cull_checkbox)
+        layout.addWidget(self.cleanup_resolved_tags_checkbox)
+        layout.addWidget(auto_cull_note)
+        layout.addWidget(self.button_box)
+
+    def _accept_options(self) -> None:
+        self.options = DuplicateCheckOptions(
+            rescan=self.rescan_checkbox.isChecked(),
+            replicate_lists=self.replicate_lists_checkbox.isChecked(),
+            replicate_tags=self.replicate_tags_checkbox.isChecked(),
+            auto_cull=self.auto_cull_checkbox.isChecked(),
+            cleanup_resolved_duplicate_tags=(
+                self.cleanup_resolved_tags_checkbox.isChecked()
+            ),
+        )
+        self.accept()
+
+
 class EditableHistoryField(QWidget):
     """Editable combo box with a Browse button and persistent recent values."""
 
@@ -2439,29 +2529,18 @@ class MainWindow(QMainWindow):
             self._open_connection_settings()
             return
 
-        response = QMessageBox.question(
-            self,
-            "Check Duplicates",
-            (
-                "This feature connects to the Karakeep server and highlights "
-                "possible duplicate bookmarks and media for review.\n\n"
-                "It compares the hash of each server asset, so it can take a "
-                "long time on large libraries. Exact media/file duplicates are "
-                "reliable; whole-bookmark duplicates only make sense as a "
-                "separate URL/text comparison and are not included in this "
-                "scan yet.\n\n"
-                "Start checking for duplicates?"
-            ),
-            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Cancel,
-        )
-        if response != QMessageBox.StandardButton.Ok:
+        dialog = DuplicateCheckDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             self._log("Duplicate check canceled.")
             return
 
-        self._start_duplicate_check_job()
+        if dialog.options is None:
+            self._log("Duplicate check options were not returned.")
+            return
 
-    def _start_duplicate_check_job(self) -> None:
+        self._start_duplicate_check_job(dialog.options)
+
+    def _start_duplicate_check_job(self, options: DuplicateCheckOptions) -> None:
         server_url = str(
             self.settings.value("connection/server_url", "") or ""
         ).strip()
@@ -2527,10 +2606,26 @@ class MainWindow(QMainWindow):
         self._update_summary()
         self._log(f"Karakeep server: {server_url}")
         self._log("Duplicate tags: POTENTIAL_DUPLICATE and PD: X")
+        self._log(
+            "Duplicate options: "
+            f"rescan={'yes' if options.rescan else 'no'}, "
+            f"union lists={'yes' if options.replicate_lists else 'no'}, "
+            f"union tags={'yes' if options.replicate_tags else 'no'}, "
+            f"cull redundant={'yes' if options.auto_cull else 'no'}, "
+            "clean resolved tags="
+            f"{'yes' if options.cleanup_resolved_duplicate_tags else 'no'}."
+        )
 
         job_config = DuplicateCheckConfig(
             server_url=server_url,
             api_key=api_key,
+            rescan=options.rescan,
+            replicate_lists=options.replicate_lists,
+            replicate_tags=options.replicate_tags,
+            auto_cull=options.auto_cull,
+            cleanup_resolved_duplicate_tags=(
+                options.cleanup_resolved_duplicate_tags
+            ),
         )
 
         self.worker_thread = QThread(self)

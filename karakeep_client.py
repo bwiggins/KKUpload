@@ -138,7 +138,34 @@ class KarakeepClient:
     def add_bookmark_to_list(self, *, list_id: str, bookmark_id: str) -> None:
         self._request("PUT", f"/lists/{list_id}/bookmarks/{bookmark_id}")
 
+    def remove_bookmark_from_list(self, *, list_id: str, bookmark_id: str) -> None:
+        self._request("DELETE", f"/lists/{list_id}/bookmarks/{bookmark_id}")
+
     def attach_tags_to_bookmark(
+        self,
+        *,
+        bookmark_id: str,
+        tag_names: tuple[str, ...],
+        attached_by: str = "human",
+    ) -> None:
+        if not tag_names:
+            return
+
+        self._request(
+            "POST",
+            f"/bookmarks/{bookmark_id}/tags",
+            json={
+                "tags": [
+                    {
+                        "tagName": tag_name,
+                        "attachedBy": attached_by,
+                    }
+                    for tag_name in tag_names
+                ]
+            },
+        )
+
+    def detach_tags_from_bookmark(
         self,
         *,
         bookmark_id: str,
@@ -148,7 +175,7 @@ class KarakeepClient:
             return
 
         self._request(
-            "POST",
+            "DELETE",
             f"/bookmarks/{bookmark_id}/tags",
             json={
                 "tags": [
@@ -172,11 +199,16 @@ class KarakeepClient:
             return tuple(self._parse_list(item) for item in data)
         return tuple(self._parse_list(item) for item in data.get("lists", []))
 
+    def delete_bookmark(self, bookmark_id: str) -> None:
+        self._request("DELETE", f"/bookmarks/{bookmark_id}")
+
+    def delete_tag(self, tag_id: str) -> None:
+        self._request("DELETE", f"/tags/{tag_id}")
+
     def list_bookmarks(self, *, include_content: bool = False) -> tuple[dict, ...]:
         return tuple(self.iter_bookmarks(include_content=include_content))
 
     def iter_bookmarks(self, *, include_content: bool = False):
-        bookmarks: list[dict] = []
         cursor: str | None = None
 
         while True:
@@ -225,6 +257,43 @@ class KarakeepClient:
                 break
 
         return tuple(tags)
+
+    def list_bookmarks_for_tag(
+        self,
+        tag_id: str,
+        *,
+        include_content: bool = False,
+    ) -> tuple[dict, ...]:
+        bookmarks: list[dict] = []
+        cursor: str | None = None
+
+        while True:
+            params: dict[str, str | int | bool] = {
+                "limit": 100,
+                "includeContent": include_content,
+            }
+            if cursor is not None:
+                params["cursor"] = cursor
+
+            response = self._request(
+                "GET",
+                f"/tags/{tag_id}/bookmarks",
+                params=params,
+            )
+            data = response.json()
+
+            if isinstance(data, list):
+                bookmarks.extend(item for item in data if isinstance(item, dict))
+                break
+
+            bookmarks.extend(
+                item for item in data.get("bookmarks", []) if isinstance(item, dict)
+            )
+            cursor = data.get("nextCursor")
+            if cursor is None:
+                break
+
+        return tuple(bookmarks)
 
     def stream_asset_bytes(self, asset_id: str):
         with httpx.stream(

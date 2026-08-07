@@ -56,6 +56,18 @@ class RecordingClient(KarakeepClient):
                 },
             )
 
+        if path == "/tags/tag-2/bookmarks" and method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "bookmarks": [{"id": "bookmark-1"}],
+                    "nextCursor": None,
+                },
+            )
+
+        if method == "DELETE":
+            return httpx.Response(204)
+
         if path == "/bookmarks":
             return httpx.Response(
                 201,
@@ -212,6 +224,71 @@ class KarakeepClientTests(unittest.TestCase):
         self.assertIsNotNone(client.last_request)
         self.assertEqual(client.last_request["method"], "GET")
         self.assertEqual(client.last_request["path"], "/tags")
+
+    def test_detach_tags_payload(self) -> None:
+        client = RecordingClient()
+
+        client.detach_tags_from_bookmark(
+            bookmark_id="bookmark-1",
+            tag_names=("POTENTIAL_DUPLICATE", "PD: 3"),
+        )
+
+        self.assertIsNotNone(client.last_request)
+        self.assertEqual(client.last_request["method"], "DELETE")
+        self.assertEqual(
+            client.last_request["path"],
+            "/bookmarks/bookmark-1/tags",
+        )
+        self.assertEqual(
+            client.last_request["kwargs"]["json"],
+            {
+                "tags": [
+                    {
+                        "tagName": "POTENTIAL_DUPLICATE",
+                        "attachedBy": "human",
+                    },
+                    {
+                        "tagName": "PD: 3",
+                        "attachedBy": "human",
+                    },
+                ]
+            },
+        )
+
+    def test_delete_bookmark_uses_bookmark_endpoint(self) -> None:
+        client = RecordingClient()
+
+        client.delete_bookmark("bookmark-1")
+
+        self.assertIsNotNone(client.last_request)
+        self.assertEqual(client.last_request["method"], "DELETE")
+        self.assertEqual(client.last_request["path"], "/bookmarks/bookmark-1")
+
+    def test_delete_tag_uses_tag_endpoint(self) -> None:
+        client = RecordingClient()
+
+        client.delete_tag("tag-2")
+
+        self.assertIsNotNone(client.last_request)
+        self.assertEqual(client.last_request["method"], "DELETE")
+        self.assertEqual(client.last_request["path"], "/tags/tag-2")
+
+    def test_list_bookmarks_for_tag_requests_tag_bookmarks(self) -> None:
+        client = RecordingClient()
+
+        bookmarks = client.list_bookmarks_for_tag("tag-2", include_content=True)
+
+        self.assertEqual([bookmark["id"] for bookmark in bookmarks], ["bookmark-1"])
+        self.assertIsNotNone(client.last_request)
+        self.assertEqual(client.last_request["method"], "GET")
+        self.assertEqual(client.last_request["path"], "/tags/tag-2/bookmarks")
+        self.assertEqual(
+            client.last_request["kwargs"]["params"],
+            {
+                "limit": 100,
+                "includeContent": True,
+            },
+        )
 
 
 if __name__ == "__main__":
