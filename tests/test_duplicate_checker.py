@@ -396,6 +396,38 @@ class DuplicateScannerTests(unittest.TestCase):
             [("bookmark-1", "DUPLICATE TITLES:\nFirst\nThird")],
         )
 
+    def test_cleanup_aggressive_merges_existing_duplicate_title_block(self) -> None:
+        client = FakeDuplicateClient()
+        scanner = DuplicateScanner(client)
+        group = DuplicateGroup(
+            group_number=3,
+            digest="same",
+            matches=(
+                BookmarkAssetFingerprint("bookmark-1", "First", "asset-1", "same"),
+                BookmarkAssetFingerprint("bookmark-3", "Third", "asset-3", "same"),
+            ),
+        )
+        client.bookmarks["bookmark-3"]["title"] = "Third"
+        client.bookmarks["bookmark-1"]["note"] = (
+            "Before\n\nDUPLICATE TITLES:\nFirst\nSecond\n\nAfter"
+        )
+
+        scanner.cleanup_duplicate_groups(
+            (group,),
+            aggressive_duplicate_clearing=True,
+            replicate_lists=False,
+            replicate_tags=False,
+            auto_cull=False,
+            cleanup_resolved_duplicate_tags=False,
+            log=lambda _message, **_kwargs: None,
+            checkpoint=lambda: None,
+        )
+
+        self.assertEqual(
+            client.updated_notes,
+            [("bookmark-1", "Before\n\nDUPLICATE TITLES:\nFirst\nSecond\nThird\n\nAfter")],
+        )
+
     def test_cleanup_auto_culls_repeated_signature_and_removes_tags_from_single(self) -> None:
         client = FakeDuplicateClient()
         scanner = DuplicateScanner(client)

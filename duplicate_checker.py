@@ -683,7 +683,54 @@ class DuplicateScanner:
         title_block = "DUPLICATE TITLES:\n" + "\n".join(titles)
         if not existing_note:
             return title_block
+        merged_note = cls._append_to_existing_duplicate_title_block(
+            existing_note,
+            titles,
+        )
+        if merged_note is not None:
+            return merged_note
         return f"{existing_note}\n\n{title_block}"
+
+    @classmethod
+    def _append_to_existing_duplicate_title_block(
+        cls,
+        note: str,
+        titles: list[str],
+    ) -> str | None:
+        lines = note.splitlines()
+        header_index = None
+        for index, line in enumerate(lines):
+            if line.strip().casefold() == "duplicate titles:":
+                header_index = index
+                break
+
+        if header_index is None:
+            return None
+
+        end_index = len(lines)
+        for index in range(header_index + 1, len(lines)):
+            if lines[index].strip() == "":
+                end_index = index
+                break
+
+        existing_titles = {
+            cls._normalized_text(line)
+            for line in lines[header_index + 1:end_index]
+            if line.strip()
+        }
+        new_titles = [
+            title
+            for title in titles
+            if cls._normalized_text(title) not in existing_titles
+        ]
+        if not new_titles:
+            return note
+
+        return "\n".join((
+            *lines[:end_index],
+            *new_titles,
+            *lines[end_index:],
+        ))
 
     @staticmethod
     def _bookmark_note(bookmark: dict) -> str:
@@ -1251,6 +1298,12 @@ class DuplicateCheckWorker(QObject):
                 self._emit_stats()
                 if not groups:
                     self._log("No existing PD duplicate groups found.", level="SUCCESS")
+                    self._log(
+                        "To discover new duplicates, run Check Duplicates again "
+                        "with Scan and Hash all server assets enabled.",
+                        level="WARNING",
+                        message_color="WARNING",
+                    )
                     self.finished.emit(False, 0, 0, 0)
                     return
 
