@@ -500,6 +500,15 @@ class PreferencesDialog(QDialog):
         view_mode_index = self.view_mode_combo.findData(preferences.view_mode)
         self.view_mode_combo.setCurrentIndex(max(view_mode_index, 0))
 
+        self.log_folder_field = QLineEdit(preferences.log_folder)
+        self.log_folder_browse_button = QPushButton("Browse...")
+        self.log_folder_browse_button.clicked.connect(self._browse_log_folder)
+
+        log_folder_layout = QHBoxLayout()
+        log_folder_layout.setContentsMargins(0, 0, 0, 0)
+        log_folder_layout.addWidget(self.log_folder_field, 1)
+        log_folder_layout.addWidget(self.log_folder_browse_button)
+
         self.maximum_allowed_size_spin = QDoubleSpinBox()
         self.maximum_allowed_size_spin.setRange(0.1, 100000.0)
         self.maximum_allowed_size_spin.setDecimals(1)
@@ -563,6 +572,15 @@ class PreferencesDialog(QDialog):
         view_group = QGroupBox("Appearance")
         view_group.setLayout(view_form)
 
+        log_form = QFormLayout()
+        log_form.setFieldGrowthPolicy(
+            QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow
+        )
+        log_form.addRow("Log folder:", log_folder_layout)
+
+        log_group = QGroupBox("Logging")
+        log_group.setLayout(log_form)
+
         helper_text = QLabel(
             "Images larger than the maximum allowed size, or rejected by "
             "Karakeep as too large, can be resized toward the desired goal."
@@ -578,13 +596,24 @@ class PreferencesDialog(QDialog):
 
         layout = QVBoxLayout(self)
         layout.addWidget(view_group)
+        layout.addWidget(log_group)
         layout.addWidget(resize_group)
         layout.addWidget(helper_text)
         layout.addWidget(self.button_box)
 
+    def _browse_log_folder(self) -> None:
+        selected = QFileDialog.getExistingDirectory(
+            self,
+            "Select Log Folder",
+            self.log_folder_field.text().strip() or str(Path.cwd()),
+        )
+        if selected:
+            self.log_folder_field.setText(selected)
+
     def _validate_and_accept(self) -> None:
         maximum_allowed = self.maximum_allowed_size_spin.value()
         desired_goal = self.desired_goal_spin.value()
+        log_folder = self.log_folder_field.text().strip()
 
         if desired_goal >= maximum_allowed:
             QMessageBox.critical(
@@ -597,8 +626,17 @@ class PreferencesDialog(QDialog):
             )
             return
 
+        if not log_folder:
+            QMessageBox.critical(
+                self,
+                "Invalid Preferences",
+                "Log folder cannot be empty.",
+            )
+            return
+
         self.preferences = AppPreferences(
             view_mode=str(self.view_mode_combo.currentData()),
+            log_folder=log_folder,
             image_resize=ImageResizePreferences(
                 maximum_allowed_image_size_mb=maximum_allowed,
                 desired_resize_goal_mb=desired_goal,
@@ -1863,6 +1901,8 @@ class MainWindow(QMainWindow):
         self.worker: UploadWorker | DuplicateCheckWorker | None = None
         self.find_dialog: FindDialog | None = None
         self.current_log_path: Path | None = None
+        self.auto_log_path: Path | None = None
+        self.auto_log_failed = False
         self.connection_status_text = "Karakeep: Not configured"
         self.marker_metrics_update_scheduled = False
         self.highlighted_console_line: int | None = None
@@ -1983,6 +2023,7 @@ class MainWindow(QMainWindow):
         self._restore_window_state()
         self._update_connection_state()
         self._update_summary()
+        self._start_auto_log_file()
         self._log("KKUpload ready.")
         for message, level in preference_load_result.messages:
             self._log(message, level=level)
@@ -2162,8 +2203,44 @@ class MainWindow(QMainWindow):
 
         self.preferences = dialog.preferences
         self._apply_view_mode(self.preferences.view_mode)
+        self._start_auto_log_file()
         self._log(f"Preferences saved: {path}", level="SUCCESS")
         return True
+
+    def _start_auto_log_file(self) -> None:
+        self.auto_log_failed = False
+        log_folder = self._resolve_log_folder(self.preferences.log_folder)
+        log_path = (
+            log_folder
+            / f"kkupload-log-{datetime.now().strftime('%Y%m%d-%H%M%S')}.txt"
+        )
+
+        try:
+            log_folder.mkdir(parents=True, exist_ok=True)
+            log_path.write_text("", encoding="utf-8")
+        except OSError as exc:
+            self.auto_log_path = None
+            self.auto_log_failed = True
+            self._log(
+                f"Automatic log file could not be created: {log_path} ({exc})",
+                level="ERROR",
+                message_color="ERROR",
+            )
+            return
+
+        self.auto_log_path = log_path
+        self._log(
+            f"Automatic log file: {log_path}",
+            level="SUCCESS",
+            message_color="SUCCESS",
+        )
+
+    @staticmethod
+    def _resolve_log_folder(log_folder: str) -> Path:
+        path = Path(log_folder).expanduser()
+        if path.is_absolute():
+            return path
+        return Path(__file__).resolve().parent / path
 
     def _apply_view_mode(self, view_mode: str) -> None:
         app = QApplication.instance()
@@ -3308,6 +3385,7 @@ class MainWindow(QMainWindow):
         for _ in range(count):
             cursor.insertBlock()
 
+        self._append_auto_log_text("\n" * count)
         self._schedule_console_marker_metrics_update()
         if should_auto_scroll:
             scrollbar = self.console.verticalScrollBar()
@@ -3437,10 +3515,52 @@ class MainWindow(QMainWindow):
         if marker_type is not None:
             self.console_marker_rail.add_marker(total_lines - 1, marker_type)
         self._schedule_console_marker_metrics_update()
+        self._append_auto_log_text(
+            self._format_log_line(
+                message,
+                timestamp=timestamp,
+                level=level,
+                include_prefix=include_prefix,
+                include_level=include_level,
+            )
+            + "\n"
+        )
 
         if should_auto_scroll:
             scrollbar = self.console.verticalScrollBar()
             scrollbar.setValue(scrollbar.maximum())
+
+    @staticmethod
+    def _format_log_line(
+        message: str,
+        *,
+        timestamp: str,
+        level: str,
+        include_prefix: bool,
+        include_level: bool,
+    ) -> str:
+        if not include_prefix:
+            return message
+        if include_level:
+            return f"[{timestamp}] [{level}] {message}"
+        return f"[{timestamp}] {message}"
+
+    def _append_auto_log_text(self, text: str) -> None:
+        if self.auto_log_path is None or self.auto_log_failed:
+            return
+
+        try:
+            with self.auto_log_path.open("a", encoding="utf-8") as handle:
+                handle.write(text)
+        except OSError as exc:
+            failed_path = self.auto_log_path
+            self.auto_log_path = None
+            self.auto_log_failed = True
+            self._log(
+                f"Automatic log file write failed: {failed_path} ({exc})",
+                level="ERROR",
+                message_color="ERROR",
+            )
 
     def _insert_console_message_text(
         self,

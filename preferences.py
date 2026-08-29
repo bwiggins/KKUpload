@@ -7,6 +7,7 @@ from typing import Any
 
 
 PREFERENCES_FILE_NAME = "preferences.json"
+DEFAULT_LOG_FOLDER_NAME = "logs"
 BYTES_PER_MB = 1024 * 1024
 
 
@@ -36,6 +37,7 @@ class ImageResizePreferences:
 class AppPreferences:
     image_resize: ImageResizePreferences
     view_mode: str = "auto"
+    log_folder: str = DEFAULT_LOG_FOLDER_NAME
 
 
 @dataclass(frozen=True)
@@ -116,12 +118,19 @@ def load_preferences(app_path: Path) -> PreferenceLoadResult:
     )
     messages.extend(validation_messages)
     view_mode = _view_mode_value(raw, "view_mode", defaults.view_mode, messages)
-    preferences = AppPreferences(image_resize=image_resize, view_mode=view_mode)
+    log_folder = _log_folder_value(raw, "log_folder", defaults.log_folder, messages)
+    preferences = AppPreferences(
+        image_resize=image_resize,
+        view_mode=view_mode,
+        log_folder=log_folder,
+    )
 
     if (
         validation_messages
         or "view_mode" not in raw
         or view_mode != raw.get("view_mode", defaults.view_mode)
+        or "log_folder" not in raw
+        or log_folder != raw.get("log_folder", defaults.log_folder)
     ):
         rewrite_needed = True
 
@@ -298,6 +307,27 @@ def _view_mode_value(
     return default
 
 
+def _log_folder_value(
+    raw: dict[str, Any],
+    key: str,
+    default: str,
+    messages: list[tuple[str, str]],
+) -> str:
+    value = raw.get(key, default)
+    if isinstance(value, str):
+        normalized = value.strip()
+        if normalized:
+            return normalized
+
+    messages.append(
+        (
+            f"Preference {key} was invalid. Using default {default}.",
+            "WARNING",
+        )
+    )
+    return default
+
+
 def _write_preferences(path: Path, preferences: AppPreferences) -> None:
     path.write_text(
         json.dumps(_preferences_to_json(preferences), indent=2) + "\n",
@@ -309,6 +339,7 @@ def _preferences_to_json(preferences: AppPreferences) -> dict[str, Any]:
     image_resize = preferences.image_resize
     return {
         "view_mode": preferences.view_mode,
+        "log_folder": preferences.log_folder,
         "image_resize": {
             "maximum_allowed_image_size_mb": (
                 image_resize.maximum_allowed_image_size_mb
