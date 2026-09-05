@@ -2778,6 +2778,7 @@ class MainWindow(QMainWindow):
         self.worker.progress_range.connect(self._set_progress_range)
         self.worker.progress.connect(self._set_progress)
         self.worker.stats.connect(self._handle_duplicate_stats)
+        self.worker.pause_requested.connect(self._handle_worker_pause_requested)
         self.worker.finished.connect(self._finish_batch)
         self.worker.finished.connect(self.worker_thread.quit)
         self.worker.finished.connect(self.worker.deleteLater)
@@ -2977,6 +2978,7 @@ class MainWindow(QMainWindow):
         self.worker.conflict_resolved.connect(self._handle_conflict_resolved)
         self.worker.unsupported_found.connect(self._handle_unsupported_found)
         self.worker.failed_file.connect(self._handle_failed_file)
+        self.worker.pause_requested.connect(self._handle_worker_pause_requested)
         self.worker.finished.connect(self._finish_batch)
         self.worker.finished.connect(self.worker_thread.quit)
         self.worker.finished.connect(self.worker.deleteLater)
@@ -3041,6 +3043,15 @@ class MainWindow(QMainWindow):
             value = stats.get(key)
             if isinstance(value, int):
                 self.duplicate_stats[key] = value
+        self._update_summary()
+
+    def _handle_worker_pause_requested(self, reason: str) -> None:
+        if not self.is_running or self.stop_requested:
+            return
+
+        self.is_paused = True
+        self.pause_button.setText("Unpause")
+        self.current_file_label.setText("Current operation: paused")
         self._update_summary()
 
     def _set_progress_range(self, total_operations: int, total_files: int) -> None:

@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import mimetypes
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import httpx
 
 from constants import KARAKEEP_API_PREFIX
 from list_planner import ListRecord
+
+
+class TimeoutProtectionProtocol(Protocol):
+    def run(self, description: str, operation):
+        ...
 
 
 class KarakeepClient:
@@ -17,10 +22,12 @@ class KarakeepClient:
         api_key: str,
         *,
         timeout: float = 10.0,
+        timeout_protection: TimeoutProtectionProtocol | None = None,
     ) -> None:
         self.server_url = self.normalized_server_url(server_url)
         self.api_key = api_key.strip()
         self.timeout = timeout
+        self.timeout_protection = timeout_protection
 
     @staticmethod
     def normalized_server_url(server_url: str) -> str:
@@ -319,13 +326,22 @@ class KarakeepClient:
             yield from response.iter_bytes()
 
     def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
-        response = httpx.request(
-            method,
-            self.api_base_url + path,
-            headers={"Authorization": f"Bearer {self.api_key}"},
-            timeout=self.timeout,
-            **kwargs,
-        )
+        def send() -> httpx.Response:
+            return httpx.request(
+                method,
+                self.api_base_url + path,
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                timeout=self.timeout,
+                **kwargs,
+            )
+
+        if self.timeout_protection is None:
+            response = send()
+        else:
+            response = self.timeout_protection.run(
+                f"{method} {path}",
+                send,
+            )
         response.raise_for_status()
         return response
 

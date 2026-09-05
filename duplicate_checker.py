@@ -10,6 +10,7 @@ import httpx
 from PySide6.QtCore import QObject, QThread, Signal
 
 from karakeep_client import KarakeepClient
+from timeout_protection import TimeoutProtection
 
 
 POTENTIAL_DUPLICATE_TAG = "POTENTIAL_DUPLICATE"
@@ -121,10 +122,24 @@ class DuplicateCheckClientProtocol(Protocol):
 class AssetHasher:
     """Reusable SHA-256 hasher for KaraKeep assets."""
 
-    def __init__(self, client: DuplicateCheckClientProtocol) -> None:
+    def __init__(
+        self,
+        client: DuplicateCheckClientProtocol,
+        *,
+        timeout_protection: TimeoutProtection | None = None,
+    ) -> None:
         self.client = client
+        self.timeout_protection = timeout_protection
 
     def hash_asset(self, asset_id: str) -> str:
+        if self.timeout_protection is not None:
+            return self.timeout_protection.run(
+                f"hash asset {asset_id}",
+                lambda: self._hash_asset_once(asset_id),
+            )
+        return self._hash_asset_once(asset_id)
+
+    def _hash_asset_once(self, asset_id: str) -> str:
         digest = hashlib.sha256()
         for chunk in self.client.stream_asset_bytes(asset_id):
             digest.update(chunk)
@@ -134,9 +149,17 @@ class AssetHasher:
 class DuplicateScanner:
     """Finds exact duplicate media by grouping bookmarks with matching hashes."""
 
-    def __init__(self, client: DuplicateCheckClientProtocol) -> None:
+    def __init__(
+        self,
+        client: DuplicateCheckClientProtocol,
+        *,
+        timeout_protection: TimeoutProtection | None = None,
+    ) -> None:
         self.client = client
-        self.hasher = AssetHasher(client)
+        self.hasher = AssetHasher(
+            client,
+            timeout_protection=timeout_protection,
+        )
 
     def existing_pd_numbers(self) -> set[int]:
         numbers: set[int] = set()
@@ -1204,6 +1227,7 @@ class DuplicateCheckWorker(QObject):
     progress_range = Signal(int, int)
     progress = Signal(int, str, int)
     stats = Signal(object)
+    pause_requested = Signal(str)
     finished = Signal(bool, int, int, int)
 
     def __init__(
@@ -1226,6 +1250,11 @@ class DuplicateCheckWorker(QObject):
         self._matching_groups = 0
         self._cleanup_total_groups = 0
         self._cleanup_processed_groups = 0
+        self._timeout_protection = TimeoutProtection(
+            log=self._log,
+            checkpoint=self._checkpoint,
+            auto_pause=self._auto_pause_for_timeout,
+        )
 
     def request_stop(self) -> None:
         self._stop_requested = True
@@ -1239,8 +1268,12 @@ class DuplicateCheckWorker(QObject):
                 self.config.server_url,
                 self.config.api_key,
                 timeout=30.0,
+                timeout_protection=self._timeout_protection,
             )
-            scanner = DuplicateScanner(client)
+            scanner = DuplicateScanner(
+                client,
+                timeout_protection=self._timeout_protection,
+            )
             self._log("Preparing duplicate maintenance job.")
             self.progress_range.emit(0, 0)
 
@@ -1432,6 +1465,10 @@ class DuplicateCheckWorker(QObject):
             QThread.msleep(100)
         if self._stop_requested:
             raise StopRequested
+
+    def _auto_pause_for_timeout(self, message: str) -> None:
+        self._paused = True
+        self.pause_requested.emit(message)
 
     def _handle_scan_progress(self, kind: str, value: int, detail) -> None:
         if kind == "scanned":

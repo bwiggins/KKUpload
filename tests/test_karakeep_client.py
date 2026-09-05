@@ -4,10 +4,12 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import httpx
 
 from karakeep_client import KarakeepClient
+from timeout_protection import TimeoutProtection
 
 
 class RecordingClient(KarakeepClient):
@@ -107,6 +109,33 @@ class RecordingClient(KarakeepClient):
 
 
 class KarakeepClientTests(unittest.TestCase):
+    def test_request_uses_timeout_protection(self) -> None:
+        request = httpx.Request("GET", "https://karakeep.example.test")
+        calls = 0
+
+        def fake_request(*_args, **_kwargs) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise httpx.ConnectTimeout("timed out", request=request)
+            return httpx.Response(200, json=[], request=request)
+
+        protection = TimeoutProtection(
+            log=lambda _message, **_kwargs: None,
+            checkpoint=lambda: None,
+            auto_pause=lambda _message: None,
+        )
+        client = KarakeepClient(
+            "https://karakeep.example.test",
+            "token",
+            timeout_protection=protection,
+        )
+
+        with patch("karakeep_client.httpx.request", side_effect=fake_request):
+            self.assertEqual(client.list_lists(), ())
+
+        self.assertEqual(calls, 2)
+
     def test_create_manual_list_does_not_send_folder_icon_text(self) -> None:
         client = RecordingClient()
 

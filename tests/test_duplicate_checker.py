@@ -1,16 +1,19 @@
 from __future__ import annotations
 
+import hashlib
 import unittest
 
 import httpx
 
 from duplicate_checker import (
+    AssetHasher,
     DuplicateGroup,
     DuplicateScanner,
     BookmarkAssetFingerprint,
     POTENTIAL_DUPLICATE_TAG,
 )
 from list_planner import ListRecord
+from timeout_protection import TimeoutProtection
 
 
 class FakeDuplicateClient:
@@ -170,7 +173,37 @@ class FailingTagListClient(FakeDuplicateClient):
         raise httpx.ConnectError("[WinError 10053] connection aborted", request=request)
 
 
+class FlakyAssetStreamClient(FakeDuplicateClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.stream_calls = 0
+
+    def stream_asset_bytes(self, asset_id: str):
+        self.stream_calls += 1
+        request = httpx.Request("GET", "https://karakeep.example.test")
+        if self.stream_calls == 1:
+            yield b"partial"
+            raise httpx.ReadTimeout("timed out", request=request)
+        yield b"complete"
+
+
 class DuplicateScannerTests(unittest.TestCase):
+    def test_asset_hash_retry_restarts_the_whole_stream(self) -> None:
+        client = FlakyAssetStreamClient()
+        protection = TimeoutProtection(
+            log=lambda _message, **_kwargs: None,
+            checkpoint=lambda: None,
+            auto_pause=lambda _message: None,
+        )
+
+        digest = AssetHasher(
+            client,
+            timeout_protection=protection,
+        ).hash_asset("asset-1")
+
+        self.assertEqual(client.stream_calls, 2)
+        self.assertEqual(digest, hashlib.sha256(b"complete").hexdigest())
+
     def test_find_duplicate_groups_uses_unused_pd_number(self) -> None:
         client = FakeDuplicateClient()
         scanner = DuplicateScanner(client)
