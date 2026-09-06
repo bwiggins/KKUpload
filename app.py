@@ -1962,6 +1962,12 @@ class MainWindow(QMainWindow):
         self.console = StatusConsole(Path(__file__).with_name("naut.png"))
         self.console.setAcceptDrops(True)
         self.console.viewport().setAcceptDrops(True)
+        self.console.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        self.console.setMinimumWidth(0)
+        self.console.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
         self.console.installEventFilter(self)
         self.console.viewport().installEventFilter(self)
         self.console.line_clicked.connect(self._highlight_console_line)
@@ -1982,6 +1988,12 @@ class MainWindow(QMainWindow):
         )
 
         self.current_file_label = QLabel("Current file: —")
+        self.current_file_label.setMinimumWidth(0)
+        self.current_file_label.setWordWrap(True)
+        self.current_file_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Preferred,
+        )
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
@@ -1993,7 +2005,7 @@ class MainWindow(QMainWindow):
         self.summary_label.setTextFormat(Qt.TextFormat.RichText)
         self.summary_label.setMinimumWidth(0)
         self.summary_label.setSizePolicy(
-            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Ignored,
             QSizePolicy.Policy.Fixed,
         )
         self.clear_console_button = QPushButton("Clear Console")
