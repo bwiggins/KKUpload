@@ -48,6 +48,7 @@ class UploadJobConfig:
     default_tags: tuple[str, ...]
     dry_run: bool
     ignore_subfolders: bool = False
+    remove_empty_subfolders_after_upload: bool = True
     unsupported_folder: Path | None = None
     dont_move_unsupported: bool = False
     omit_top_folder_list: bool = False
@@ -1071,7 +1072,45 @@ class UploadWorker(QObject):
             self._log(f"Moving {kind} file to: {destination}")
         shutil.move(str(file.file_path), str(destination))
         self._log(f"Moved {kind} file to: {destination}", level="SUCCESS")
+        self._remove_empty_upload_subfolders(file.file_path.parent)
         return destination
+
+    def _remove_empty_upload_subfolders(self, start_folder: Path) -> None:
+        if not self.config.remove_empty_subfolders_after_upload:
+            return
+
+        try:
+            upload_root = self.config.upload_folder.resolve()
+        except OSError as exc:
+            self._log(
+                f"Unable to resolve upload folder for empty-folder cleanup: {exc}",
+                level="WARNING",
+                message_color="WARNING",
+            )
+            return
+
+        folder = start_folder
+        while True:
+            try:
+                resolved = folder.resolve()
+            except OSError:
+                break
+
+            if resolved == upload_root:
+                break
+
+            try:
+                resolved.relative_to(upload_root)
+            except ValueError:
+                break
+
+            try:
+                folder.rmdir()
+            except OSError:
+                break
+
+            self._log(f"Removed empty upload subfolder: {folder}")
+            folder = folder.parent
 
     def _resolve_move_conflict(
         self,

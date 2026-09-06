@@ -593,6 +593,44 @@ class UploadWorkerTests(unittest.TestCase):
             self.assertTrue(
                 (completed_folder / "fart" / "burp" / "poop.jpg").exists()
             )
+            self.assertFalse(nested_folder.exists())
+            self.assertFalse((upload_folder / "fart").exists())
+            self.assertTrue(upload_folder.exists())
+
+    def test_live_upload_can_leave_empty_upload_subfolders(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            upload_folder = root / "upload"
+            completed_folder = root / "completed"
+            nested_folder = upload_folder / "fart" / "burp"
+            nested_folder.mkdir(parents=True)
+            (nested_folder / "poop.jpg").write_text("x")
+
+            worker = UploadWorker(
+                UploadJobConfig(
+                    server_url="https://karakeep.example.test",
+                    api_key="token",
+                    upload_folder=upload_folder,
+                    completed_folder=completed_folder,
+                    error_folder=root / "errors",
+                    dont_move_completed=False,
+                    dont_move_failed=False,
+                    dont_preserve_move_structure=False,
+                    move_conflict_mode="ask",
+                    import_to_root=False,
+                    root_list="IMPORT SORTING",
+                    default_tags=(),
+                    dry_run=False,
+                    remove_empty_subfolders_after_upload=False,
+                ),
+                client=SuccessfulUploadClient(),
+            )
+
+            worker.run()
+
+            self.assertFalse((nested_folder / "poop.jpg").exists())
+            self.assertTrue(nested_folder.exists())
+            self.assertTrue((upload_folder / "fart").exists())
 
     def test_live_upload_can_flatten_move_structure(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

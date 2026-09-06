@@ -92,6 +92,7 @@ class UploadConfiguration:
     ignore_subfolders: bool
     no_import_tags: bool
     omit_top_folder_list: bool
+    remove_empty_subfolders_after_upload: bool
     import_to_root: bool
     root_list: str
     default_tags: tuple[str, ...]
@@ -106,6 +107,12 @@ class DuplicateCheckOptions:
     replicate_tags: bool
     auto_cull: bool
     cleanup_resolved_duplicate_tags: bool
+
+
+@dataclass(frozen=True)
+class PersistentNotice:
+    key: str
+    message: str
 
 
 def _tooltip(text: str, *, width: int = 72) -> str:
@@ -735,11 +742,22 @@ class UploadDialog(QDialog):
             self._update_generated_output_folders
         )
 
-        self.omit_top_folder_list_checkbox = QCheckBox("Omit top folder")
+        self.omit_top_folder_list_checkbox = QCheckBox("Omit top folder name")
         self.omit_top_folder_list_checkbox.setChecked(
             self.settings.value(
                 "upload/omit_top_folder_list",
                 False,
+                type=bool,
+            )
+        )
+
+        self.remove_empty_subfolders_checkbox = QCheckBox(
+            "Remove empty subfolders after upload"
+        )
+        self.remove_empty_subfolders_checkbox.setChecked(
+            self.settings.value(
+                "upload/remove_empty_subfolders_after_upload",
+                True,
                 type=bool,
             )
         )
@@ -905,10 +923,16 @@ class UploadDialog(QDialog):
         upload_options_layout.addWidget(self.ignore_subfolders_checkbox)
         upload_options_layout.addStretch(1)
 
+        cleanup_options_layout = QHBoxLayout()
+        cleanup_options_layout.setContentsMargins(0, 0, 0, 0)
+        cleanup_options_layout.addWidget(self.remove_empty_subfolders_checkbox)
+        cleanup_options_layout.addStretch(1)
+
         form_layout.addRow("Folder to upload:", self.upload_field)
         form_layout.addRow("", upload_options_layout)
         form_layout.addRow(QLabel(" "))
         form_layout.addRow(self._section_label("Move files after processing"))
+        form_layout.addRow("", cleanup_options_layout)
         form_layout.addRow("Completed folder:", completed_layout)
         form_layout.addRow("Error folder:", error_layout)
         form_layout.addRow("Unsupported folder:", unsupported_layout)
@@ -1087,6 +1111,9 @@ class UploadDialog(QDialog):
         ignore_subfolders = self.ignore_subfolders_checkbox.isChecked()
         no_import_tags = self.no_import_tags_checkbox.isChecked()
         omit_top_folder_list = self.omit_top_folder_list_checkbox.isChecked()
+        remove_empty_subfolders_after_upload = (
+            self.remove_empty_subfolders_checkbox.isChecked()
+        )
 
         if auto_generate_output_folders:
             self._update_generated_output_folders()
@@ -1224,6 +1251,9 @@ class UploadDialog(QDialog):
             ignore_subfolders=ignore_subfolders,
             no_import_tags=no_import_tags,
             omit_top_folder_list=omit_top_folder_list,
+            remove_empty_subfolders_after_upload=(
+                remove_empty_subfolders_after_upload
+            ),
             import_to_root=import_to_root,
             root_list=root_list,
             default_tags=tags,
@@ -1288,6 +1318,10 @@ class UploadDialog(QDialog):
         self.settings.setValue(
             "upload/omit_top_folder_list",
             self.omit_top_folder_list_checkbox.isChecked(),
+        )
+        self.settings.setValue(
+            "upload/remove_empty_subfolders_after_upload",
+            self.remove_empty_subfolders_checkbox.isChecked(),
         )
         self.settings.setValue(
             "upload/dont_move_failed",
@@ -1904,7 +1938,9 @@ class MainWindow(QMainWindow):
         self.find_dialog: FindDialog | None = None
         self.current_log_path: Path | None = None
         self.auto_log_path: Path | None = None
+        self.auto_log_failed_path: Path | None = None
         self.auto_log_failed = False
+        self.persistent_notices: dict[str, PersistentNotice] = {}
         self.connection_status_text = "Karakeep: Not configured"
         self.marker_metrics_update_scheduled = False
         self.highlighted_console_line: int | None = None
@@ -1992,6 +2028,50 @@ class MainWindow(QMainWindow):
             lambda _size: self._schedule_console_marker_metrics_update()
         )
 
+        self.notice_bar = QWidget()
+        self.notice_bar.setVisible(False)
+        self.notice_bar.setStyleSheet(
+            """
+            QWidget {
+                background: #3b2f12;
+                border: 1px solid #a16207;
+                border-radius: 4px;
+            }
+            QLabel {
+                color: #fef3c7;
+                border: none;
+                background: transparent;
+            }
+            QPushButton {
+                background: #facc15;
+                color: #1f2937;
+                border: 1px solid #eab308;
+                border-radius: 4px;
+                padding: 3px 8px;
+            }
+            QPushButton:hover {
+                background: #fde047;
+            }
+            """
+        )
+        self.notice_label = QLabel("")
+        self.notice_label.setWordWrap(True)
+        self.notice_label.setMinimumWidth(0)
+        self.notice_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Preferred,
+        )
+        self.notice_retry_button = QPushButton("Retry")
+        self.notice_retry_button.clicked.connect(self._retry_auto_log_file)
+        self.notice_new_log_button = QPushButton("Start New Log File")
+        self.notice_new_log_button.clicked.connect(self._start_replacement_auto_log_file)
+
+        notice_layout = QHBoxLayout(self.notice_bar)
+        notice_layout.setContentsMargins(8, 6, 8, 6)
+        notice_layout.addWidget(self.notice_label, 1)
+        notice_layout.addWidget(self.notice_retry_button)
+        notice_layout.addWidget(self.notice_new_log_button)
+
         self.current_file_label = QLabel("Current file: —")
         self.current_file_label.setMinimumWidth(0)
         self.current_file_label.setWordWrap(True)
@@ -2023,6 +2103,7 @@ class MainWindow(QMainWindow):
         central_widget = QWidget()
         layout = QVBoxLayout(central_widget)
         layout.addLayout(button_layout)
+        layout.addWidget(self.notice_bar)
 
         console_layout = QHBoxLayout()
         console_layout.setContentsMargins(0, 0, 0, 0)
@@ -2226,18 +2307,17 @@ class MainWindow(QMainWindow):
 
     def _start_auto_log_file(self) -> None:
         self.auto_log_failed = False
+        self.auto_log_failed_path = None
+        self._clear_persistent_notice("auto-log-failed")
         log_folder = self._resolve_log_folder(self.preferences.log_folder)
-        log_path = (
-            log_folder
-            / f"kkupload-log-{datetime.now().strftime('%Y%m%d-%H%M%S')}.txt"
-        )
+        log_path = self._new_auto_log_path(log_folder)
 
         try:
             log_folder.mkdir(parents=True, exist_ok=True)
             log_path.write_text("", encoding="utf-8")
         except OSError as exc:
             self.auto_log_path = None
-            self.auto_log_failed = True
+            self._set_auto_log_failed(log_path)
             self._log(
                 f"Automatic log file could not be created: {log_path} ({exc})",
                 level="ERROR",
@@ -2251,6 +2331,108 @@ class MainWindow(QMainWindow):
             level="SUCCESS",
             message_color="SUCCESS",
         )
+
+    @staticmethod
+    def _new_auto_log_path(log_folder: Path) -> Path:
+        return (
+            log_folder
+            / f"kkupload-log-{datetime.now().strftime('%Y%m%d-%H%M%S')}.txt"
+        )
+
+    def _retry_auto_log_file(self) -> None:
+        if self.auto_log_failed_path is None:
+            self._start_replacement_auto_log_file()
+            return
+
+        log_path = self.auto_log_failed_path
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with log_path.open("a", encoding="utf-8"):
+                pass
+        except OSError as exc:
+            self._set_auto_log_failed(log_path)
+            self._log(
+                f"Automatic log file retry failed: {log_path} ({exc})",
+                level="ERROR",
+                message_color="ERROR",
+            )
+            return
+
+        self.auto_log_path = log_path
+        self.auto_log_failed = False
+        self.auto_log_failed_path = None
+        self._clear_persistent_notice("auto-log-failed")
+        self._log(
+            f"Automatic log file writing resumed: {log_path}",
+            level="SUCCESS",
+            message_color="SUCCESS",
+        )
+
+    def _start_replacement_auto_log_file(self) -> None:
+        log_folder = self._resolve_log_folder(self.preferences.log_folder)
+        log_path = self._new_auto_log_path(log_folder)
+        console_text = self.console.toPlainText()
+        if console_text and not console_text.endswith("\n"):
+            console_text += "\n"
+
+        try:
+            log_folder.mkdir(parents=True, exist_ok=True)
+            log_path.write_text(console_text, encoding="utf-8")
+        except OSError as exc:
+            self.auto_log_path = None
+            self._set_auto_log_failed(log_path)
+            self._log(
+                f"Replacement automatic log file could not be created: "
+                f"{log_path} ({exc})",
+                level="ERROR",
+                message_color="ERROR",
+            )
+            return
+
+        self.auto_log_path = log_path
+        self.auto_log_failed = False
+        self.auto_log_failed_path = None
+        self._clear_persistent_notice("auto-log-failed")
+        self._log(
+            f"Automatic log file restarted: {log_path}",
+            level="SUCCESS",
+            message_color="SUCCESS",
+        )
+
+    def _set_auto_log_failed(self, log_path: Path) -> None:
+        self.auto_log_failed = True
+        self.auto_log_failed_path = log_path
+        self._set_persistent_notice(
+            PersistentNotice(
+                key="auto-log-failed",
+                message=(
+                    "Automatic file logging is off. Retry the current log file, "
+                    "or start a new log file using the current console contents."
+                ),
+            )
+        )
+
+    def _set_persistent_notice(self, notice: PersistentNotice) -> None:
+        self.persistent_notices[notice.key] = notice
+        self._update_notice_bar()
+
+    def _clear_persistent_notice(self, key: str) -> None:
+        if key in self.persistent_notices:
+            del self.persistent_notices[key]
+        self._update_notice_bar()
+
+    def _update_notice_bar(self) -> None:
+        if not self.persistent_notices:
+            self.notice_bar.setVisible(False)
+            self.notice_label.setText("")
+            return
+
+        notice = next(iter(self.persistent_notices.values()))
+        self.notice_label.setText(notice.message)
+        is_auto_log_notice = notice.key == "auto-log-failed"
+        self.notice_retry_button.setVisible(is_auto_log_notice)
+        self.notice_new_log_button.setVisible(is_auto_log_notice)
+        self.notice_bar.setVisible(True)
 
     @staticmethod
     def _resolve_log_folder(log_folder: str) -> Path:
@@ -2979,6 +3161,9 @@ class MainWindow(QMainWindow):
             default_tags=config.default_tags,
             dry_run=config.dry_run,
             omit_top_folder_list=config.omit_top_folder_list,
+            remove_empty_subfolders_after_upload=(
+                config.remove_empty_subfolders_after_upload
+            ),
             image_resize_preferences=self.preferences.image_resize,
             timing_stats_path=default_timing_stats_path(Path(__file__)),
         )
@@ -3583,9 +3768,11 @@ class MainWindow(QMainWindow):
         except OSError as exc:
             failed_path = self.auto_log_path
             self.auto_log_path = None
-            self.auto_log_failed = True
+            self._set_auto_log_failed(failed_path)
             self._log(
-                f"Automatic log file write failed: {failed_path} ({exc})",
+                "Automatic log file write failed: "
+                f"{failed_path} ({exc}). Use the warning above the console to "
+                "retry logging or start a new automatic log file.",
                 level="ERROR",
                 message_color="ERROR",
             )
