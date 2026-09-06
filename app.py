@@ -557,6 +557,12 @@ class PreferencesDialog(QDialog):
         resize_form.setFieldGrowthPolicy(
             QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow
         )
+        resize_helper_text = QLabel(
+            "Images larger than the maximum allowed size, or rejected by "
+            "Karakeep as too large, can be resized toward the desired goal."
+        )
+        resize_helper_text.setWordWrap(True)
+        resize_form.addRow(resize_helper_text)
         resize_form.addRow(
             "Maximum allowed image size:",
             self.maximum_allowed_size_spin,
@@ -590,12 +596,6 @@ class PreferencesDialog(QDialog):
         log_group = QGroupBox("Logging")
         log_group.setLayout(log_form)
 
-        helper_text = QLabel(
-            "Images larger than the maximum allowed size, or rejected by "
-            "Karakeep as too large, can be resized toward the desired goal."
-        )
-        helper_text.setWordWrap(True)
-
         self.button_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Cancel
             | QDialogButtonBox.StandardButton.Save
@@ -607,7 +607,6 @@ class PreferencesDialog(QDialog):
         layout.addWidget(view_group)
         layout.addWidget(log_group)
         layout.addWidget(resize_group)
-        layout.addWidget(helper_text)
         layout.addWidget(self.button_box)
 
     def _browse_log_folder(self) -> None:
@@ -923,16 +922,18 @@ class UploadDialog(QDialog):
         upload_options_layout.addWidget(self.ignore_subfolders_checkbox)
         upload_options_layout.addStretch(1)
 
-        cleanup_options_layout = QHBoxLayout()
-        cleanup_options_layout.setContentsMargins(0, 0, 0, 0)
-        cleanup_options_layout.addWidget(self.remove_empty_subfolders_checkbox)
-        cleanup_options_layout.addStretch(1)
+        upload_cleanup_options_layout = QHBoxLayout()
+        upload_cleanup_options_layout.setContentsMargins(0, 0, 0, 0)
+        upload_cleanup_options_layout.addWidget(
+            self.remove_empty_subfolders_checkbox
+        )
+        upload_cleanup_options_layout.addStretch(1)
 
         form_layout.addRow("Folder to upload:", self.upload_field)
         form_layout.addRow("", upload_options_layout)
+        form_layout.addRow("", upload_cleanup_options_layout)
         form_layout.addRow(QLabel(" "))
         form_layout.addRow(self._section_label("Move files after processing"))
-        form_layout.addRow("", cleanup_options_layout)
         form_layout.addRow("Completed folder:", completed_layout)
         form_layout.addRow("Error folder:", error_layout)
         form_layout.addRow("Unsupported folder:", unsupported_layout)
@@ -988,6 +989,7 @@ class UploadDialog(QDialog):
 
         layout.addLayout(bottom_layout)
 
+        self._apply_tooltips()
         self._update_root_list_state(
             self.import_to_root_checkbox.isChecked()
         )
@@ -997,6 +999,115 @@ class UploadDialog(QDialog):
             self.ignore_subfolders_checkbox.isChecked()
         )
         self._update_tags_state(self.no_import_tags_checkbox.isChecked())
+
+    def _apply_tooltips(self) -> None:
+        self._set_tooltip(
+            self.upload_field,
+            "The local folder containing files to upload into Karakeep. "
+            "Subfolders can become list names unless subfolder handling is "
+            "disabled below.",
+        )
+        self._set_tooltip(
+            self.completed_field,
+            "Files that upload successfully are moved here after processing "
+            "unless Don't move is checked.",
+        )
+        self._set_tooltip(
+            self.error_field,
+            "Files that fail during upload are moved here so they can be "
+            "reviewed or retried later.",
+        )
+        self._set_tooltip(
+            self.unsupported_field,
+            "Files with unsupported types are moved here instead of being "
+            "mixed into upload failures.",
+        )
+        self._set_tooltip(
+            self.resize_images_if_needed_checkbox,
+            "Allows oversized images to be resized using the limits from "
+            "Preferences before retrying the upload.",
+        )
+        self._set_tooltip(
+            self.auto_generate_output_folders_checkbox,
+            "Automatically fills the completed, error, and unsupported "
+            "folders based on the selected upload folder.",
+        )
+        self._set_tooltip(
+            self.omit_top_folder_list_checkbox,
+            "Leaves the selected upload folder name out of generated "
+            "Karakeep list paths while still using subfolder names.",
+        )
+        self._set_tooltip(
+            self.ignore_subfolders_checkbox,
+            "Uploads files from subfolders without turning those subfolder "
+            "names into Karakeep list paths.",
+        )
+        self._set_tooltip(
+            self.remove_empty_subfolders_checkbox,
+            "Deletes empty source subfolders after their files have been "
+            "processed and moved.",
+        )
+        self._set_tooltip(
+            self.dont_move_completed_checkbox,
+            "Leaves successfully uploaded files in the upload folder instead "
+            "of moving them to the completed folder.",
+        )
+        self._set_tooltip(
+            self.dont_move_failed_checkbox,
+            "Leaves failed files in the upload folder instead of moving them "
+            "to the error folder.",
+        )
+        self._set_tooltip(
+            self.dont_move_unsupported_checkbox,
+            "Leaves unsupported files in the upload folder instead of moving "
+            "them to the unsupported folder.",
+        )
+        self._set_tooltip(
+            self.dont_preserve_move_structure_checkbox,
+            "Moves processed files directly into the output folders instead "
+            "of recreating their source subfolder structure.",
+        )
+        self._set_tooltip(
+            self.move_conflict_combo,
+            "Chooses what happens if a processed file would overwrite an "
+            "existing file in an output folder.",
+        )
+        self._set_tooltip(
+            self.root_list_combo,
+            "The base Karakeep list for new uploads. Use / to create or "
+            "target nested sublists.",
+        )
+        self._set_tooltip(
+            self.import_to_root_checkbox,
+            "Uploads without assigning the base import list. Folder-derived "
+            "lists can still be created from the upload folder and its "
+            "subfolders.",
+        )
+        self._set_tooltip(
+            self.tags_combo,
+            "Comma-separated tags applied to every uploaded bookmark unless "
+            "No import tags is checked.",
+        )
+        self._set_tooltip(
+            self.no_import_tags_checkbox,
+            "Uploads without applying the default tags entered here.",
+        )
+        self._set_tooltip(
+            self.dry_run_checkbox,
+            "Runs through the batch planning and logging without uploading "
+            "or moving files.",
+        )
+        self._set_tooltip(
+            self.start_button,
+            "Starts the configured batch using the current upload settings.",
+        )
+
+    @staticmethod
+    def _set_tooltip(widget: QWidget, text: str) -> None:
+        tooltip = _tooltip(text)
+        widget.setToolTip(tooltip)
+        for child in widget.findChildren(QWidget):
+            child.setToolTip(tooltip)
 
     def _update_root_list_state(self, import_to_root: bool) -> None:
         self.root_list_combo.setEnabled(not import_to_root)
@@ -2131,7 +2242,6 @@ class MainWindow(QMainWindow):
         file_menu = self.menuBar().addMenu("&File")
 
         configure_upload_action = QAction("Configure Upload", self)
-        configure_upload_action.setShortcut("Ctrl+U")
         configure_upload_action.triggered.connect(
             lambda: self._open_upload_dialog()
         )
@@ -2147,11 +2257,6 @@ class MainWindow(QMainWindow):
         file_menu.addAction(pause_action)
 
         file_menu.addSeparator()
-
-        save_log_action = QAction("Save Log", self)
-        save_log_action.setShortcut("Ctrl+S")
-        save_log_action.triggered.connect(self._save_log)
-        file_menu.addAction(save_log_action)
 
         save_log_as_action = QAction("Save Log As...", self)
         save_log_as_action.setShortcut("Ctrl+Shift+S")
@@ -2693,9 +2798,7 @@ class MainWindow(QMainWindow):
     def _show_keyboard_shortcuts(self) -> None:
         message = (
             "<table>"
-            "<tr><td><b>Configure Upload</b></td><td>&nbsp;&nbsp;Ctrl+U</td></tr>"
             "<tr><td><b>Pause / Unpause</b></td><td>&nbsp;&nbsp;Ctrl+Space</td></tr>"
-            "<tr><td><b>Save Log</b></td><td>&nbsp;&nbsp;Ctrl+S</td></tr>"
             "<tr><td><b>Save Log As</b></td><td>&nbsp;&nbsp;Ctrl+Shift+S</td></tr>"
             "<tr><td><b>Find</b></td><td>&nbsp;&nbsp;Ctrl+F</td></tr>"
             "<tr><td><b>Prev Issue</b></td><td>&nbsp;&nbsp;Ctrl+Comma</td></tr>"
