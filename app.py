@@ -18,6 +18,7 @@ from PySide6.QtGui import (
     QColor,
     QCloseEvent,
     QFont,
+    QIcon,
     QPainter,
     QPalette,
     QPixmap,
@@ -68,6 +69,7 @@ APP_NAME: Final[str] = "KKUpload"
 ORGANIZATION_NAME: Final[str] = "Brad"
 DEFAULT_ROOT_LIST: Final[str] = "$ KKUpload"
 DEFAULT_TAGS: Final[str] = "!!-TAGGING-!!"
+APP_USER_MODEL_ID: Final[str] = "Brad.KKUpload"
 MAX_RECENT_VALUES: Final[int] = 10
 KEYRING_SERVICE: Final[str] = "KKUpload"
 KEYRING_USERNAME: Final[str] = "karakeep_api_key"
@@ -1915,6 +1917,9 @@ class MainWindow(QMainWindow):
         self.log_flush_timer.timeout.connect(self._flush_pending_logs)
 
         self.setWindowTitle(APP_NAME)
+        icon_path = Path(__file__).with_name("kkupload.ico")
+        if icon_path.exists():
+            self.setWindowIcon(QIcon(str(icon_path)))
         self.resize(900, 650)
         self.setAcceptDrops(True)
         self._create_menu_bar()
@@ -3832,9 +3837,22 @@ class MainWindow(QMainWindow):
 def main() -> int:
     global DEFAULT_APP_PALETTE
 
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                APP_USER_MODEL_ID
+            )
+        except Exception:
+            pass
+
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setOrganizationName(ORGANIZATION_NAME)
+    icon_path = Path(__file__).with_name("kkupload.ico")
+    if icon_path.exists():
+        app.setWindowIcon(QIcon(str(icon_path)))
     DEFAULT_APP_PALETTE = app.palette()
 
     window = MainWindow()

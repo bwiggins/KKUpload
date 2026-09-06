@@ -8,6 +8,16 @@ The goal is to make collecting and organizing large media libraries significantl
 
 This project is designed around the author's personal workflow but should remain useful for anyone maintaining a large self-hosted Karakeep archive.
 
+## Windows Shortcut
+
+To create a local Windows shortcut with the KKUpload icon, run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Create-KKUploadShortcut.ps1
+```
+
+This creates `KKUpload.lnk` in the project folder. You can pin that shortcut to Start or copy it wherever you prefer.
+
 ---
 
 # Design Goals

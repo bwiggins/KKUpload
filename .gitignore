@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 settings.json
 timing_stats.json
+KKUpload.lnk
 logs/
 dist/
 build/
