@@ -2040,6 +2040,8 @@ class MainWindow(QMainWindow):
         self.total_operations = 0
         self.total_files = 0
         self.job_started_at: float | None = None
+        self.eta_started_at: float | None = None
+        self.eta_completed_base = 0
         self.stop_requested = False
         self.is_paused = False
         self.is_running = False
@@ -3360,10 +3362,21 @@ class MainWindow(QMainWindow):
         self._update_summary()
 
     def _set_progress_range(self, total_operations: int, total_files: int) -> None:
+        previous_completed_operations = self.completed_operations
         self.total_operations = total_operations
         self.total_files = total_files
         self.progress_bar.setRange(0, total_operations)
         self.progress_bar.setValue(0)
+        if total_operations > 0:
+            self.eta_started_at = time.monotonic()
+            self.eta_completed_base = (
+                0
+                if previous_completed_operations > total_operations
+                else previous_completed_operations
+            )
+        else:
+            self.eta_started_at = None
+            self.eta_completed_base = 0
         self._update_summary()
 
     def _set_progress(
@@ -3499,6 +3512,8 @@ class MainWindow(QMainWindow):
         self.total_operations = 0
         self.total_files = 0
         self.job_started_at = None
+        self.eta_started_at = None
+        self.eta_completed_base = 0
         self.current_file_label.setText("Current file: -")
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
@@ -3602,9 +3617,13 @@ class MainWindow(QMainWindow):
         if (
             not self.is_running
             or self.job_started_at is None
-            or self.completed_operations <= 0
+            or self.eta_started_at is None
             or self.total_operations <= 0
         ):
+            return "--"
+
+        completed_in_eta_window = self.completed_operations - self.eta_completed_base
+        if completed_in_eta_window <= 0:
             return "--"
 
         remaining_operations = max(
@@ -3614,8 +3633,8 @@ class MainWindow(QMainWindow):
         if remaining_operations <= 0:
             return "00:00"
 
-        elapsed = max(time.monotonic() - self.job_started_at, 0.1)
-        seconds_per_operation = elapsed / self.completed_operations
+        elapsed = max(time.monotonic() - self.eta_started_at, 0.1)
+        seconds_per_operation = elapsed / completed_in_eta_window
         remaining_seconds = int(round(seconds_per_operation * remaining_operations))
         return self._format_duration(remaining_seconds)
 
