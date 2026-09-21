@@ -239,3 +239,11 @@ Every feature should be motivated by actual use rather than speculation.
 
 Small, working improvements are preferred over large unfinished systems.
 
+---
+
+# License
+
+KKUpload is available under the [MIT License](LICENSE).
+
+Copyright (c) 2026 Brad Wiggins
+

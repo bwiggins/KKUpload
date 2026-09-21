@@ -2,14 +2,7 @@
 __pycache__/
 *.pyc
 settings.json
-__pycache__/
-*.pyc
-settings.json
 preferences.json
-timing_stats.json
-KKUpload.lnk
-logs/
-
 timing_stats.json
 KKUpload.lnk
 logs/
