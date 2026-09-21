@@ -45,13 +45,10 @@ class PreferencesTests(unittest.TestCase):
                 49.0,
             )
             self.assertEqual(result.preferences.view_mode, "auto")
-<<<<<<< Updated upstream
-=======
             self.assertEqual(
                 result.preferences.log_folder,
                 self._default_log_folder(),
             )
->>>>>>> Stashed changes
             self.assertIn("Created defaults and loaded successfully", result.messages[0][0])
 
     def test_invalid_preferences_are_rewritten_with_valid_defaults(self) -> None:
@@ -81,16 +78,12 @@ class PreferencesTests(unittest.TestCase):
                 49.0,
             )
             self.assertEqual(result.preferences.view_mode, "auto")
-<<<<<<< Updated upstream
-            self.assertEqual(rewritten["view_mode"], "auto")
-=======
             self.assertEqual(
                 result.preferences.log_folder,
                 self._default_log_folder(),
             )
             self.assertEqual(rewritten["view_mode"], "auto")
             self.assertEqual(rewritten["log_folder"], self._default_log_folder())
->>>>>>> Stashed changes
             self.assertEqual(rewritten["image_resize"]["maximum_attempts"], 4)
             self.assertIs(
                 rewritten["image_resize"]["fail_if_not_within_goal"],
@@ -166,8 +159,6 @@ class PreferencesTests(unittest.TestCase):
             self.assertEqual(result.preferences.view_mode, "light")
             self.assertEqual(rewritten["view_mode"], "light")
 
-<<<<<<< Updated upstream
-=======
     def test_load_preferences_accepts_saved_log_folder(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             app_path = Path(temp_dir) / "app.py"
@@ -221,15 +212,16 @@ class PreferencesTests(unittest.TestCase):
             self.assertTrue(migrated_path.exists())
             self.assertFalse(legacy_path.exists())
             self.assertEqual(result.preferences.view_mode, "dark")
-            self.assertEqual(result.preferences.log_folder, self._default_log_folder())
+            self.assertEqual(
+                result.preferences.log_folder,
+                self._default_log_folder(),
+            )
             self.assertTrue(
                 any(
                     "Moved legacy preferences" in message
                     for message, _ in result.messages
                 )
             )
-
->>>>>>> Stashed changes
 
 if __name__ == "__main__":
     unittest.main()

@@ -39,10 +39,7 @@ class ImageResizePreferences:
 class AppPreferences:
     image_resize: ImageResizePreferences
     view_mode: str = "auto"
-<<<<<<< Updated upstream
-=======
     log_folder: str = field(default_factory=lambda: str(default_log_dir()))
->>>>>>> Stashed changes
 
 
 @dataclass(frozen=True)
@@ -145,9 +142,6 @@ def load_preferences(app_path: Path) -> PreferenceLoadResult:
     )
     messages.extend(validation_messages)
     view_mode = _view_mode_value(raw, "view_mode", defaults.view_mode, messages)
-<<<<<<< Updated upstream
-    preferences = AppPreferences(image_resize=image_resize, view_mode=view_mode)
-=======
     log_folder = _log_folder_value(raw, "log_folder", defaults.log_folder, messages)
     if migrated_legacy_preferences and log_folder == "logs":
         log_folder = defaults.log_folder
@@ -157,12 +151,13 @@ def load_preferences(app_path: Path) -> PreferenceLoadResult:
         view_mode=view_mode,
         log_folder=log_folder,
     )
->>>>>>> Stashed changes
 
     if (
         validation_messages
         or "view_mode" not in raw
         or view_mode != raw.get("view_mode", defaults.view_mode)
+        or "log_folder" not in raw
+        or log_folder != raw.get("log_folder", defaults.log_folder)
     ):
         rewrite_needed = True
 
@@ -339,6 +334,27 @@ def _view_mode_value(
     return default
 
 
+def _log_folder_value(
+    raw: dict[str, Any],
+    key: str,
+    default: str,
+    messages: list[tuple[str, str]],
+) -> str:
+    value = raw.get(key, default)
+    if isinstance(value, str):
+        normalized = value.strip()
+        if normalized:
+            return normalized
+
+    messages.append(
+        (
+            f"Preference {key} was invalid. Using default {default}.",
+            "WARNING",
+        )
+    )
+    return default
+
+
 def _write_preferences(path: Path, preferences: AppPreferences) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -351,6 +367,7 @@ def _preferences_to_json(preferences: AppPreferences) -> dict[str, Any]:
     image_resize = preferences.image_resize
     return {
         "view_mode": preferences.view_mode,
+        "log_folder": preferences.log_folder,
         "image_resize": {
             "maximum_allowed_image_size_mb": (
                 image_resize.maximum_allowed_image_size_mb
