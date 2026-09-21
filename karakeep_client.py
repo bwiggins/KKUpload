@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import mimetypes
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import httpx
 
 from constants import KARAKEEP_API_PREFIX
 from list_planner import ListRecord
+
+
+class TimeoutProtectionProtocol(Protocol):
+    def run(self, description: str, operation):
+        ...
 
 
 class KarakeepClient:
@@ -17,10 +22,12 @@ class KarakeepClient:
         api_key: str,
         *,
         timeout: float = 10.0,
+        timeout_protection: TimeoutProtectionProtocol | None = None,
     ) -> None:
         self.server_url = self.normalized_server_url(server_url)
         self.api_key = api_key.strip()
         self.timeout = timeout
+        self.timeout_protection = timeout_protection
 
     @staticmethod
     def normalized_server_url(server_url: str) -> str:
@@ -138,7 +145,34 @@ class KarakeepClient:
     def add_bookmark_to_list(self, *, list_id: str, bookmark_id: str) -> None:
         self._request("PUT", f"/lists/{list_id}/bookmarks/{bookmark_id}")
 
+    def remove_bookmark_from_list(self, *, list_id: str, bookmark_id: str) -> None:
+        self._request("DELETE", f"/lists/{list_id}/bookmarks/{bookmark_id}")
+
     def attach_tags_to_bookmark(
+        self,
+        *,
+        bookmark_id: str,
+        tag_names: tuple[str, ...],
+        attached_by: str = "human",
+    ) -> None:
+        if not tag_names:
+            return
+
+        self._request(
+            "POST",
+            f"/bookmarks/{bookmark_id}/tags",
+            json={
+                "tags": [
+                    {
+                        "tagName": tag_name,
+                        "attachedBy": attached_by,
+                    }
+                    for tag_name in tag_names
+                ]
+            },
+        )
+
+    def detach_tags_from_bookmark(
         self,
         *,
         bookmark_id: str,
@@ -148,7 +182,7 @@ class KarakeepClient:
             return
 
         self._request(
-            "POST",
+            "DELETE",
             f"/bookmarks/{bookmark_id}/tags",
             json={
                 "tags": [
@@ -172,14 +206,142 @@ class KarakeepClient:
             return tuple(self._parse_list(item) for item in data)
         return tuple(self._parse_list(item) for item in data.get("lists", []))
 
-    def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
-        response = httpx.request(
-            method,
-            self.api_base_url + path,
+    def update_bookmark_note(
+        self,
+        *,
+        bookmark_id: str,
+        note: str,
+    ) -> dict[str, Any]:
+        response = self._request(
+            "PATCH",
+            f"/bookmarks/{bookmark_id}",
+            json={"note": note},
+        )
+        return response.json()
+
+    def delete_bookmark(self, bookmark_id: str) -> None:
+        self._request("DELETE", f"/bookmarks/{bookmark_id}")
+
+    def delete_tag(self, tag_id: str) -> None:
+        self._request("DELETE", f"/tags/{tag_id}")
+
+    def list_bookmarks(self, *, include_content: bool = False) -> tuple[dict, ...]:
+        return tuple(self.iter_bookmarks(include_content=include_content))
+
+    def iter_bookmarks(self, *, include_content: bool = False):
+        cursor: str | None = None
+
+        while True:
+            params: dict[str, str | int | bool] = {
+                "limit": 100,
+                "includeContent": include_content,
+            }
+            if cursor is not None:
+                params["cursor"] = cursor
+
+            response = self._request("GET", "/bookmarks", params=params)
+            data = response.json()
+
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict):
+                        yield item
+                break
+
+            for item in data.get("bookmarks", []):
+                if isinstance(item, dict):
+                    yield item
+            cursor = data.get("nextCursor")
+            if cursor is None:
+                break
+
+    def list_tags(self) -> tuple[dict, ...]:
+        tags: list[dict] = []
+        cursor: str | None = None
+
+        while True:
+            params: dict[str, str | int] = {"limit": 100}
+            if cursor is not None:
+                params["cursor"] = cursor
+
+            response = self._request("GET", "/tags", params=params)
+            data = response.json()
+
+            if isinstance(data, list):
+                tags.extend(item for item in data if isinstance(item, dict))
+                break
+
+            tags.extend(item for item in data.get("tags", []) if isinstance(item, dict))
+            cursor = data.get("nextCursor")
+            if cursor is None:
+                break
+
+        return tuple(tags)
+
+    def list_bookmarks_for_tag(
+        self,
+        tag_id: str,
+        *,
+        include_content: bool = False,
+    ) -> tuple[dict, ...]:
+        bookmarks: list[dict] = []
+        cursor: str | None = None
+
+        while True:
+            params: dict[str, str | int | bool] = {
+                "limit": 100,
+                "includeContent": include_content,
+            }
+            if cursor is not None:
+                params["cursor"] = cursor
+
+            response = self._request(
+                "GET",
+                f"/tags/{tag_id}/bookmarks",
+                params=params,
+            )
+            data = response.json()
+
+            if isinstance(data, list):
+                bookmarks.extend(item for item in data if isinstance(item, dict))
+                break
+
+            bookmarks.extend(
+                item for item in data.get("bookmarks", []) if isinstance(item, dict)
+            )
+            cursor = data.get("nextCursor")
+            if cursor is None:
+                break
+
+        return tuple(bookmarks)
+
+    def stream_asset_bytes(self, asset_id: str):
+        with httpx.stream(
+            "GET",
+            self.api_base_url + f"/assets/{asset_id}",
             headers={"Authorization": f"Bearer {self.api_key}"},
             timeout=self.timeout,
-            **kwargs,
-        )
+        ) as response:
+            response.raise_for_status()
+            yield from response.iter_bytes()
+
+    def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
+        def send() -> httpx.Response:
+            return httpx.request(
+                method,
+                self.api_base_url + path,
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                timeout=self.timeout,
+                **kwargs,
+            )
+
+        if self.timeout_protection is None:
+            response = send()
+        else:
+            response = self.timeout_protection.run(
+                f"{method} {path}",
+                send,
+            )
         response.raise_for_status()
         return response
 

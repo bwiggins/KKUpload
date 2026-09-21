@@ -49,6 +49,7 @@ class PreferencesTests(unittest.TestCase):
                 result.preferences.log_folder,
                 self._default_log_folder(),
             )
+
             self.assertIn("Created defaults and loaded successfully", result.messages[0][0])
 
     def test_invalid_preferences_are_rewritten_with_valid_defaults(self) -> None:
@@ -84,6 +85,7 @@ class PreferencesTests(unittest.TestCase):
             )
             self.assertEqual(rewritten["view_mode"], "auto")
             self.assertEqual(rewritten["log_folder"], self._default_log_folder())
+
             self.assertEqual(rewritten["image_resize"]["maximum_attempts"], 4)
             self.assertIs(
                 rewritten["image_resize"]["fail_if_not_within_goal"],
@@ -101,6 +103,7 @@ class PreferencesTests(unittest.TestCase):
             app_path = Path(temp_dir) / "app.py"
             preferences = AppPreferences(
                 view_mode="dark",
+                log_folder="A:/KKU/Logs",
                 image_resize=ImageResizePreferences(
                     maximum_allowed_image_size_mb=80.0,
                     desired_resize_goal_mb=32.5,
@@ -114,6 +117,7 @@ class PreferencesTests(unittest.TestCase):
             saved = json.loads(path.read_text(encoding="utf-8"))
 
             self.assertEqual(saved["view_mode"], "dark")
+            self.assertEqual(saved["log_folder"], "A:/KKU/Logs")
             self.assertEqual(
                 saved["image_resize"]["maximum_allowed_image_size_mb"],
                 80.0,
@@ -164,6 +168,7 @@ class PreferencesTests(unittest.TestCase):
             app_path = Path(temp_dir) / "app.py"
             path = preferences_path(app_path)
             path.parent.mkdir(parents=True, exist_ok=True)
+
             path.write_text(
                 json.dumps(
                     {
@@ -222,6 +227,7 @@ class PreferencesTests(unittest.TestCase):
                     for message, _ in result.messages
                 )
             )
+
 
 if __name__ == "__main__":
     unittest.main()

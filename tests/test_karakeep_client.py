@@ -4,10 +4,12 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import httpx
 
 from karakeep_client import KarakeepClient
+from timeout_protection import TimeoutProtection
 
 
 class RecordingClient(KarakeepClient):
@@ -29,6 +31,51 @@ class RecordingClient(KarakeepClient):
                     "contentType": "image/jpeg",
                     "size": 1,
                     "fileName": "image.jpg",
+                },
+            )
+
+        if path == "/bookmarks" and method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "bookmarks": [
+                        {"id": "bookmark-1"},
+                        {"id": "bookmark-2"},
+                    ],
+                    "nextCursor": None,
+                },
+            )
+
+        if path == "/tags" and method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "tags": [
+                        {"id": "tag-1", "name": "POTENTIAL_DUPLICATE"},
+                        {"id": "tag-2", "name": "PD: 4"},
+                    ],
+                    "nextCursor": None,
+                },
+            )
+
+        if path == "/tags/tag-2/bookmarks" and method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "bookmarks": [{"id": "bookmark-1"}],
+                    "nextCursor": None,
+                },
+            )
+
+        if method == "DELETE":
+            return httpx.Response(204)
+
+        if method == "PATCH" and path.startswith("/bookmarks/"):
+            return httpx.Response(
+                200,
+                json={
+                    "id": path.rsplit("/", 1)[-1],
+                    **kwargs["json"],
                 },
             )
 
@@ -62,6 +109,33 @@ class RecordingClient(KarakeepClient):
 
 
 class KarakeepClientTests(unittest.TestCase):
+    def test_request_uses_timeout_protection(self) -> None:
+        request = httpx.Request("GET", "https://karakeep.example.test")
+        calls = 0
+
+        def fake_request(*_args, **_kwargs) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise httpx.ConnectTimeout("timed out", request=request)
+            return httpx.Response(200, json=[], request=request)
+
+        protection = TimeoutProtection(
+            log=lambda _message, **_kwargs: None,
+            checkpoint=lambda: None,
+            auto_pause=lambda _message: None,
+        )
+        client = KarakeepClient(
+            "https://karakeep.example.test",
+            "token",
+            timeout_protection=protection,
+        )
+
+        with patch("karakeep_client.httpx.request", side_effect=fake_request):
+            self.assertEqual(client.list_lists(), ())
+
+        self.assertEqual(calls, 2)
+
     def test_create_manual_list_does_not_send_folder_icon_text(self) -> None:
         client = RecordingClient()
 
@@ -153,6 +227,120 @@ class KarakeepClientTests(unittest.TestCase):
                         "attachedBy": "human",
                     },
                 ]
+            },
+        )
+
+    def test_list_bookmarks_requests_content(self) -> None:
+        client = RecordingClient()
+
+        bookmarks = client.list_bookmarks(include_content=True)
+
+        self.assertEqual(
+            [bookmark["id"] for bookmark in bookmarks],
+            ["bookmark-1", "bookmark-2"],
+        )
+        self.assertIsNotNone(client.last_request)
+        self.assertEqual(client.last_request["method"], "GET")
+        self.assertEqual(client.last_request["path"], "/bookmarks")
+        self.assertEqual(
+            client.last_request["kwargs"]["params"],
+            {
+                "limit": 100,
+                "includeContent": True,
+            },
+        )
+
+    def test_list_tags_returns_tag_records(self) -> None:
+        client = RecordingClient()
+
+        tags = client.list_tags()
+
+        self.assertEqual(
+            [tag["name"] for tag in tags],
+            ["POTENTIAL_DUPLICATE", "PD: 4"],
+        )
+        self.assertIsNotNone(client.last_request)
+        self.assertEqual(client.last_request["method"], "GET")
+        self.assertEqual(client.last_request["path"], "/tags")
+
+    def test_detach_tags_payload(self) -> None:
+        client = RecordingClient()
+
+        client.detach_tags_from_bookmark(
+            bookmark_id="bookmark-1",
+            tag_names=("POTENTIAL_DUPLICATE", "PD: 3"),
+        )
+
+        self.assertIsNotNone(client.last_request)
+        self.assertEqual(client.last_request["method"], "DELETE")
+        self.assertEqual(
+            client.last_request["path"],
+            "/bookmarks/bookmark-1/tags",
+        )
+        self.assertEqual(
+            client.last_request["kwargs"]["json"],
+            {
+                "tags": [
+                    {
+                        "tagName": "POTENTIAL_DUPLICATE",
+                        "attachedBy": "human",
+                    },
+                    {
+                        "tagName": "PD: 3",
+                        "attachedBy": "human",
+                    },
+                ]
+            },
+        )
+
+    def test_delete_bookmark_uses_bookmark_endpoint(self) -> None:
+        client = RecordingClient()
+
+        client.delete_bookmark("bookmark-1")
+
+        self.assertIsNotNone(client.last_request)
+        self.assertEqual(client.last_request["method"], "DELETE")
+        self.assertEqual(client.last_request["path"], "/bookmarks/bookmark-1")
+
+    def test_update_bookmark_note_uses_patch_endpoint(self) -> None:
+        client = RecordingClient()
+
+        client.update_bookmark_note(
+            bookmark_id="bookmark-1",
+            note="DUPLICATE TITLES:\nFirst\nSecond",
+        )
+
+        self.assertIsNotNone(client.last_request)
+        self.assertEqual(client.last_request["method"], "PATCH")
+        self.assertEqual(client.last_request["path"], "/bookmarks/bookmark-1")
+        self.assertEqual(
+            client.last_request["kwargs"]["json"],
+            {"note": "DUPLICATE TITLES:\nFirst\nSecond"},
+        )
+
+    def test_delete_tag_uses_tag_endpoint(self) -> None:
+        client = RecordingClient()
+
+        client.delete_tag("tag-2")
+
+        self.assertIsNotNone(client.last_request)
+        self.assertEqual(client.last_request["method"], "DELETE")
+        self.assertEqual(client.last_request["path"], "/tags/tag-2")
+
+    def test_list_bookmarks_for_tag_requests_tag_bookmarks(self) -> None:
+        client = RecordingClient()
+
+        bookmarks = client.list_bookmarks_for_tag("tag-2", include_content=True)
+
+        self.assertEqual([bookmark["id"] for bookmark in bookmarks], ["bookmark-1"])
+        self.assertIsNotNone(client.last_request)
+        self.assertEqual(client.last_request["method"], "GET")
+        self.assertEqual(client.last_request["path"], "/tags/tag-2/bookmarks")
+        self.assertEqual(
+            client.last_request["kwargs"]["params"],
+            {
+                "limit": 100,
+                "includeContent": True,
             },
         )
 

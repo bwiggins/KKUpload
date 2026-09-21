@@ -29,6 +29,7 @@ from timing_stats import (
     new_upload_timing_sample,
     record_upload_timing,
 )
+from timeout_protection import TimeoutProtection
 
 
 @dataclass(frozen=True)
@@ -47,6 +48,7 @@ class UploadJobConfig:
     default_tags: tuple[str, ...]
     dry_run: bool
     ignore_subfolders: bool = False
+    remove_empty_subfolders_after_upload: bool = True
     unsupported_folder: Path | None = None
     dont_move_unsupported: bool = False
     omit_top_folder_list: bool = False
@@ -130,6 +132,7 @@ class UploadWorker(QObject):
     conflict_resolved = Signal(int)
     unsupported_found = Signal(int)
     failed_file = Signal(str, str)
+    pause_requested = Signal(str)
     finished = Signal(bool, int, int, int)
 
     def __init__(
@@ -147,12 +150,29 @@ class UploadWorker(QObject):
         self._run_started_at = 0.0
         self._uploaded_bytes = 0
         self._upload_seconds = 0.0
+        self._timeout_protection = TimeoutProtection(
+            log=self._log,
+            checkpoint=self._checkpoint,
+            auto_pause=self._auto_pause_for_timeout,
+        )
 
     def request_stop(self) -> None:
         self._stop_requested = True
 
     def set_paused(self, paused: bool) -> None:
         self._paused = paused
+
+    def _checkpoint(self) -> None:
+        if self._stop_requested:
+            raise StopRequested
+        while self._paused and not self._stop_requested:
+            QThread.msleep(100)
+        if self._stop_requested:
+            raise StopRequested
+
+    def _auto_pause_for_timeout(self, message: str) -> None:
+        self._paused = True
+        self.pause_requested.emit(message)
 
     def run(self) -> None:
         succeeded = 0
@@ -168,6 +188,7 @@ class UploadWorker(QObject):
                 client = self._client or KarakeepClient(
                     self.config.server_url,
                     self.config.api_key,
+                    timeout_protection=self._timeout_protection,
                 )
 
                 scan_result = self._scan()
@@ -293,6 +314,9 @@ class UploadWorker(QObject):
                     source_bytes=total_source_bytes,
                 )
             self.finished.emit(False, succeeded, failed, not_processed)
+        except StopRequested:
+            not_processed = max(not_processed, 0)
+            self.finished.emit(True, succeeded, failed, not_processed)
         except Exception as exc:  # noqa: BLE001
             self._log(f"Batch failed: {exc}", level="ERROR", message_color="ERROR")
             failed += 1
@@ -1048,7 +1072,45 @@ class UploadWorker(QObject):
             self._log(f"Moving {kind} file to: {destination}")
         shutil.move(str(file.file_path), str(destination))
         self._log(f"Moved {kind} file to: {destination}", level="SUCCESS")
+        self._remove_empty_upload_subfolders(file.file_path.parent)
         return destination
+
+    def _remove_empty_upload_subfolders(self, start_folder: Path) -> None:
+        if not self.config.remove_empty_subfolders_after_upload:
+            return
+
+        try:
+            upload_root = self.config.upload_folder.resolve()
+        except OSError as exc:
+            self._log(
+                f"Unable to resolve upload folder for empty-folder cleanup: {exc}",
+                level="WARNING",
+                message_color="WARNING",
+            )
+            return
+
+        folder = start_folder
+        while True:
+            try:
+                resolved = folder.resolve()
+            except OSError:
+                break
+
+            if resolved == upload_root:
+                break
+
+            try:
+                resolved.relative_to(upload_root)
+            except ValueError:
+                break
+
+            try:
+                folder.rmdir()
+            except OSError:
+                break
+
+            self._log(f"Removed empty upload subfolder: {folder}")
+            folder = folder.parent
 
     def _resolve_move_conflict(
         self,
@@ -1330,3 +1392,7 @@ class UploadWorker(QObject):
         message_color: str | None = None,
     ) -> None:
         self.log.emit(message, level, message_color)
+
+
+class StopRequested(Exception):
+    pass

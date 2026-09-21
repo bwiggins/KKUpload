@@ -10,6 +10,7 @@ from app_paths import default_log_dir, user_data_dir
 
 
 PREFERENCES_FILE_NAME = "preferences.json"
+DEFAULT_LOG_FOLDER_NAME = "logs"
 BYTES_PER_MB = 1024 * 1024
 
 
@@ -40,6 +41,7 @@ class AppPreferences:
     image_resize: ImageResizePreferences
     view_mode: str = "auto"
     log_folder: str = field(default_factory=lambda: str(default_log_dir()))
+
 
 
 @dataclass(frozen=True)
@@ -146,6 +148,7 @@ def load_preferences(app_path: Path) -> PreferenceLoadResult:
     if migrated_legacy_preferences and log_folder == "logs":
         log_folder = defaults.log_folder
         rewrite_needed = True
+
     preferences = AppPreferences(
         image_resize=image_resize,
         view_mode=view_mode,

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import sys
 import time
+import re
+import webbrowser
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -16,6 +18,7 @@ from PySide6.QtGui import (
     QColor,
     QCloseEvent,
     QFont,
+    QIcon,
     QPainter,
     QPalette,
     QPixmap,
@@ -58,6 +61,7 @@ from preferences import (
 )
 from scanner import validate_separate_folder_tree
 from timing_stats import default_timing_stats_path
+from duplicate_checker import DuplicateCheckConfig, DuplicateCheckWorker
 from upload_worker import MoveConflictRequest, UploadJobConfig, UploadWorker
 
 
@@ -65,6 +69,7 @@ APP_NAME: Final[str] = "KKUpload"
 ORGANIZATION_NAME: Final[str] = "Brad"
 DEFAULT_ROOT_LIST: Final[str] = "$ KKUpload"
 DEFAULT_TAGS: Final[str] = "!!-TAGGING-!!"
+APP_USER_MODEL_ID: Final[str] = "Brad.KKUpload"
 MAX_RECENT_VALUES: Final[int] = 10
 KEYRING_SERVICE: Final[str] = "KKUpload"
 KEYRING_USERNAME: Final[str] = "karakeep_api_key"
@@ -87,10 +92,168 @@ class UploadConfiguration:
     ignore_subfolders: bool
     no_import_tags: bool
     omit_top_folder_list: bool
+    remove_empty_subfolders_after_upload: bool
     import_to_root: bool
     root_list: str
     default_tags: tuple[str, ...]
     dry_run: bool
+
+
+@dataclass(frozen=True)
+class DuplicateCheckOptions:
+    rescan: bool
+    aggressive_duplicate_clearing: bool
+    replicate_lists: bool
+    replicate_tags: bool
+    auto_cull: bool
+    cleanup_resolved_duplicate_tags: bool
+
+
+@dataclass(frozen=True)
+class PersistentNotice:
+    key: str
+    message: str
+
+
+def _tooltip(text: str, *, width: int = 72) -> str:
+    words = text.split()
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        if current and len(candidate) > width:
+            lines.append(current)
+            current = word
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    return "\n".join(lines)
+
+
+class DuplicateCheckDialog(QDialog):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.options: DuplicateCheckOptions | None = None
+
+        self.setWindowTitle("Check Duplicates")
+        self.setMinimumWidth(560)
+
+        message = QLabel(
+            "Duplicate maintenance connects to the Karakeep server and can "
+            "highlight possible duplicate bookmarks and media for review. "
+            "If the Karakeep server has 1000+ bookmarks, some operations can "
+            "take days to complete, though the UI will keep you informed of "
+            "the state."
+        )
+        message.setWordWrap(True)
+
+        scan_help = (
+            "Scanning downloads and hashes every server asset, which is "
+            "extremely time consuming on large libraries. Skip this to use "
+            "the existing POTENTIAL_DUPLICATE and PD: X groups already on the "
+            "server."
+        )
+
+        self.rescan_checkbox = QCheckBox(
+            "Scan and Hash all server assets (very time consuming)"
+        )
+        self.rescan_checkbox.setChecked(True)
+        self.rescan_checkbox.setToolTip(_tooltip(scan_help))
+
+        self.aggressive_duplicate_clearing_checkbox = QCheckBox(
+            "Aggressive Duplicate Clearing"
+        )
+        self.aggressive_duplicate_clearing_checkbox.setToolTip(_tooltip(
+            "Performs all of the custom cleanup operations, but also removes "
+            "items with differing names, keeps only one instance, and appends "
+            "the names of all duplicates to the note field."
+        ))
+        self.replicate_lists_checkbox = QCheckBox(
+            "Union all lists across each duplicate group"
+        )
+        self.replicate_lists_checkbox.setChecked(True)
+        self.replicate_lists_checkbox.setToolTip(_tooltip(
+            "Copies all lists present on any bookmark in the duplicate group "
+            "so they are present on every bookmark in that group."
+        ))
+        self.replicate_tags_checkbox = QCheckBox(
+            "Union all tags across each duplicate group"
+        )
+        self.replicate_tags_checkbox.setChecked(True)
+        self.replicate_tags_checkbox.setToolTip(_tooltip(
+            "Copies all tags present on any bookmark in the duplicate group "
+            "so they are present on every bookmark in that group."
+        ))
+        self.auto_cull_checkbox = QCheckBox(
+            "Cull redundant duplicates after cleanup"
+        )
+        self.auto_cull_checkbox.setChecked(True)
+        self.auto_cull_checkbox.setToolTip(_tooltip(
+            "Culling keeps one bookmark for each unique combination of name, "
+            "description, lists, and tags, and removes only redundant repeats."
+        ))
+        self.cleanup_resolved_tags_checkbox = QCheckBox(
+            "Clean up resolved duplicate tags"
+        )
+        self.cleanup_resolved_tags_checkbox.setChecked(True)
+        self.cleanup_resolved_tags_checkbox.setToolTip(_tooltip(
+            "Resolved tag cleanup deletes the PD: X tag for groups with one "
+            "or fewer bookmarks and removes POTENTIAL_DUPLICATE from any "
+            "remaining bookmark."
+        ))
+        self.aggressive_duplicate_clearing_checkbox.toggled.connect(
+            self._update_cleanup_option_state
+        )
+
+        self.button_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Cancel
+            | QDialogButtonBox.StandardButton.Ok
+        )
+        self.button_box.accepted.connect(self._accept_options)
+        self.button_box.rejected.connect(self.reject)
+
+        self.cleanup_group = QGroupBox("Custom cleanup")
+        cleanup_layout = QVBoxLayout(self.cleanup_group)
+        cleanup_layout.addWidget(self.replicate_lists_checkbox)
+        cleanup_layout.addWidget(self.replicate_tags_checkbox)
+        cleanup_layout.addWidget(self.auto_cull_checkbox)
+        cleanup_layout.addWidget(self.cleanup_resolved_tags_checkbox)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(message)
+        layout.addSpacing(8)
+        layout.addWidget(self.rescan_checkbox)
+        layout.addSpacing(8)
+        layout.addWidget(self.aggressive_duplicate_clearing_checkbox)
+        layout.addWidget(self.cleanup_group)
+        layout.addWidget(self.button_box)
+        self._update_cleanup_option_state(
+            self.aggressive_duplicate_clearing_checkbox.isChecked()
+        )
+
+    def _update_cleanup_option_state(self, aggressive: bool) -> None:
+        self.cleanup_group.setEnabled(not aggressive)
+
+    def _accept_options(self) -> None:
+        aggressive = self.aggressive_duplicate_clearing_checkbox.isChecked()
+        self.options = DuplicateCheckOptions(
+            rescan=self.rescan_checkbox.isChecked(),
+            aggressive_duplicate_clearing=aggressive,
+            replicate_lists=(
+                False if aggressive else self.replicate_lists_checkbox.isChecked()
+            ),
+            replicate_tags=(
+                False if aggressive else self.replicate_tags_checkbox.isChecked()
+            ),
+            auto_cull=False if aggressive else self.auto_cull_checkbox.isChecked(),
+            cleanup_resolved_duplicate_tags=(
+                False
+                if aggressive
+                else self.cleanup_resolved_tags_checkbox.isChecked()
+            ),
+        )
+        self.accept()
 
 
 class EditableHistoryField(QWidget):
@@ -346,6 +509,15 @@ class PreferencesDialog(QDialog):
         view_mode_index = self.view_mode_combo.findData(preferences.view_mode)
         self.view_mode_combo.setCurrentIndex(max(view_mode_index, 0))
 
+        self.log_folder_field = QLineEdit(preferences.log_folder)
+        self.log_folder_browse_button = QPushButton("Browse...")
+        self.log_folder_browse_button.clicked.connect(self._browse_log_folder)
+
+        log_folder_layout = QHBoxLayout()
+        log_folder_layout.setContentsMargins(0, 0, 0, 0)
+        log_folder_layout.addWidget(self.log_folder_field, 1)
+        log_folder_layout.addWidget(self.log_folder_browse_button)
+
         self.maximum_allowed_size_spin = QDoubleSpinBox()
         self.maximum_allowed_size_spin.setRange(0.1, 100000.0)
         self.maximum_allowed_size_spin.setDecimals(1)
@@ -385,6 +557,12 @@ class PreferencesDialog(QDialog):
         resize_form.setFieldGrowthPolicy(
             QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow
         )
+        resize_helper_text = QLabel(
+            "Images larger than the maximum allowed size, or rejected by "
+            "Karakeep as too large, can be resized toward the desired goal."
+        )
+        resize_helper_text.setWordWrap(True)
+        resize_form.addRow(resize_helper_text)
         resize_form.addRow(
             "Maximum allowed image size:",
             self.maximum_allowed_size_spin,
@@ -409,11 +587,14 @@ class PreferencesDialog(QDialog):
         view_group = QGroupBox("Appearance")
         view_group.setLayout(view_form)
 
-        helper_text = QLabel(
-            "Images larger than the maximum allowed size, or rejected by "
-            "Karakeep as too large, can be resized toward the desired goal."
+        log_form = QFormLayout()
+        log_form.setFieldGrowthPolicy(
+            QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow
         )
-        helper_text.setWordWrap(True)
+        log_form.addRow("Log folder:", log_folder_layout)
+
+        log_group = QGroupBox("Logging")
+        log_group.setLayout(log_form)
 
         self.button_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Cancel
@@ -424,13 +605,23 @@ class PreferencesDialog(QDialog):
 
         layout = QVBoxLayout(self)
         layout.addWidget(view_group)
+        layout.addWidget(log_group)
         layout.addWidget(resize_group)
-        layout.addWidget(helper_text)
         layout.addWidget(self.button_box)
+
+    def _browse_log_folder(self) -> None:
+        selected = QFileDialog.getExistingDirectory(
+            self,
+            "Select Log Folder",
+            self.log_folder_field.text().strip() or str(Path.cwd()),
+        )
+        if selected:
+            self.log_folder_field.setText(selected)
 
     def _validate_and_accept(self) -> None:
         maximum_allowed = self.maximum_allowed_size_spin.value()
         desired_goal = self.desired_goal_spin.value()
+        log_folder = self.log_folder_field.text().strip()
 
         if desired_goal >= maximum_allowed:
             QMessageBox.critical(
@@ -443,8 +634,17 @@ class PreferencesDialog(QDialog):
             )
             return
 
+        if not log_folder:
+            QMessageBox.critical(
+                self,
+                "Invalid Preferences",
+                "Log folder cannot be empty.",
+            )
+            return
+
         self.preferences = AppPreferences(
             view_mode=str(self.view_mode_combo.currentData()),
+            log_folder=log_folder,
             image_resize=ImageResizePreferences(
                 maximum_allowed_image_size_mb=maximum_allowed,
                 desired_resize_goal_mb=desired_goal,
@@ -541,11 +741,22 @@ class UploadDialog(QDialog):
             self._update_generated_output_folders
         )
 
-        self.omit_top_folder_list_checkbox = QCheckBox("Omit top folder")
+        self.omit_top_folder_list_checkbox = QCheckBox("Omit top folder name")
         self.omit_top_folder_list_checkbox.setChecked(
             self.settings.value(
                 "upload/omit_top_folder_list",
                 False,
+                type=bool,
+            )
+        )
+
+        self.remove_empty_subfolders_checkbox = QCheckBox(
+            "Remove empty subfolders after upload"
+        )
+        self.remove_empty_subfolders_checkbox.setChecked(
+            self.settings.value(
+                "upload/remove_empty_subfolders_after_upload",
+                True,
                 type=bool,
             )
         )
@@ -711,8 +922,16 @@ class UploadDialog(QDialog):
         upload_options_layout.addWidget(self.ignore_subfolders_checkbox)
         upload_options_layout.addStretch(1)
 
+        upload_cleanup_options_layout = QHBoxLayout()
+        upload_cleanup_options_layout.setContentsMargins(0, 0, 0, 0)
+        upload_cleanup_options_layout.addWidget(
+            self.remove_empty_subfolders_checkbox
+        )
+        upload_cleanup_options_layout.addStretch(1)
+
         form_layout.addRow("Folder to upload:", self.upload_field)
         form_layout.addRow("", upload_options_layout)
+        form_layout.addRow("", upload_cleanup_options_layout)
         form_layout.addRow(QLabel(" "))
         form_layout.addRow(self._section_label("Move files after processing"))
         form_layout.addRow("Completed folder:", completed_layout)
@@ -770,6 +989,7 @@ class UploadDialog(QDialog):
 
         layout.addLayout(bottom_layout)
 
+        self._apply_tooltips()
         self._update_root_list_state(
             self.import_to_root_checkbox.isChecked()
         )
@@ -779,6 +999,115 @@ class UploadDialog(QDialog):
             self.ignore_subfolders_checkbox.isChecked()
         )
         self._update_tags_state(self.no_import_tags_checkbox.isChecked())
+
+    def _apply_tooltips(self) -> None:
+        self._set_tooltip(
+            self.upload_field,
+            "The local folder containing files to upload into Karakeep. "
+            "Subfolders can become list names unless subfolder handling is "
+            "disabled below.",
+        )
+        self._set_tooltip(
+            self.completed_field,
+            "Files that upload successfully are moved here after processing "
+            "unless Don't move is checked.",
+        )
+        self._set_tooltip(
+            self.error_field,
+            "Files that fail during upload are moved here so they can be "
+            "reviewed or retried later.",
+        )
+        self._set_tooltip(
+            self.unsupported_field,
+            "Files with unsupported types are moved here instead of being "
+            "mixed into upload failures.",
+        )
+        self._set_tooltip(
+            self.resize_images_if_needed_checkbox,
+            "Allows oversized images to be resized using the limits from "
+            "Preferences before retrying the upload.",
+        )
+        self._set_tooltip(
+            self.auto_generate_output_folders_checkbox,
+            "Automatically fills the completed, error, and unsupported "
+            "folders based on the selected upload folder.",
+        )
+        self._set_tooltip(
+            self.omit_top_folder_list_checkbox,
+            "Leaves the selected upload folder name out of generated "
+            "Karakeep list paths while still using subfolder names.",
+        )
+        self._set_tooltip(
+            self.ignore_subfolders_checkbox,
+            "Uploads files from subfolders without turning those subfolder "
+            "names into Karakeep list paths.",
+        )
+        self._set_tooltip(
+            self.remove_empty_subfolders_checkbox,
+            "Deletes empty source subfolders after their files have been "
+            "processed and moved.",
+        )
+        self._set_tooltip(
+            self.dont_move_completed_checkbox,
+            "Leaves successfully uploaded files in the upload folder instead "
+            "of moving them to the completed folder.",
+        )
+        self._set_tooltip(
+            self.dont_move_failed_checkbox,
+            "Leaves failed files in the upload folder instead of moving them "
+            "to the error folder.",
+        )
+        self._set_tooltip(
+            self.dont_move_unsupported_checkbox,
+            "Leaves unsupported files in the upload folder instead of moving "
+            "them to the unsupported folder.",
+        )
+        self._set_tooltip(
+            self.dont_preserve_move_structure_checkbox,
+            "Moves processed files directly into the output folders instead "
+            "of recreating their source subfolder structure.",
+        )
+        self._set_tooltip(
+            self.move_conflict_combo,
+            "Chooses what happens if a processed file would overwrite an "
+            "existing file in an output folder.",
+        )
+        self._set_tooltip(
+            self.root_list_combo,
+            "The base Karakeep list for new uploads. Use / to create or "
+            "target nested sublists.",
+        )
+        self._set_tooltip(
+            self.import_to_root_checkbox,
+            "Uploads without assigning the base import list. Folder-derived "
+            "lists can still be created from the upload folder and its "
+            "subfolders.",
+        )
+        self._set_tooltip(
+            self.tags_combo,
+            "Comma-separated tags applied to every uploaded bookmark unless "
+            "No import tags is checked.",
+        )
+        self._set_tooltip(
+            self.no_import_tags_checkbox,
+            "Uploads without applying the default tags entered here.",
+        )
+        self._set_tooltip(
+            self.dry_run_checkbox,
+            "Runs through the batch planning and logging without uploading "
+            "or moving files.",
+        )
+        self._set_tooltip(
+            self.start_button,
+            "Starts the configured batch using the current upload settings.",
+        )
+
+    @staticmethod
+    def _set_tooltip(widget: QWidget, text: str) -> None:
+        tooltip = _tooltip(text)
+        widget.setToolTip(tooltip)
+        for child in widget.findChildren(QWidget):
+            child.setToolTip(tooltip)
 
     def _update_root_list_state(self, import_to_root: bool) -> None:
         self.root_list_combo.setEnabled(not import_to_root)
@@ -893,6 +1222,9 @@ class UploadDialog(QDialog):
         ignore_subfolders = self.ignore_subfolders_checkbox.isChecked()
         no_import_tags = self.no_import_tags_checkbox.isChecked()
         omit_top_folder_list = self.omit_top_folder_list_checkbox.isChecked()
+        remove_empty_subfolders_after_upload = (
+            self.remove_empty_subfolders_checkbox.isChecked()
+        )
 
         if auto_generate_output_folders:
             self._update_generated_output_folders()
@@ -1030,6 +1362,9 @@ class UploadDialog(QDialog):
             ignore_subfolders=ignore_subfolders,
             no_import_tags=no_import_tags,
             omit_top_folder_list=omit_top_folder_list,
+            remove_empty_subfolders_after_upload=(
+                remove_empty_subfolders_after_upload
+            ),
             import_to_root=import_to_root,
             root_list=root_list,
             default_tags=tags,
@@ -1094,6 +1429,10 @@ class UploadDialog(QDialog):
         self.settings.setValue(
             "upload/omit_top_folder_list",
             self.omit_top_folder_list_checkbox.isChecked(),
+        )
+        self.settings.setValue(
+            "upload/remove_empty_subfolders_after_upload",
+            self.remove_empty_subfolders_checkbox.isChecked(),
         )
         self.settings.setValue(
             "upload/dont_move_failed",
@@ -1434,6 +1773,7 @@ class StatusConsole(QPlainTextEdit):
         super().__init__(parent)
 
         self._watermark = QPixmap(str(watermark_path))
+        self._visited_urls: set[str] = set()
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
         super().mousePressEvent(event)
@@ -1442,9 +1782,45 @@ class StatusConsole(QPlainTextEdit):
             return
 
         cursor = self.cursorForPosition(event.position().toPoint())
+        block_text = cursor.block().text()
+        clicked_url = self._url_at_cursor(block_text, cursor.positionInBlock())
+        if clicked_url is not None:
+            self._visited_urls.add(clicked_url)
+            self._mark_url_visited(clicked_url)
+            webbrowser.open(clicked_url)
+            return
+
         block_number = cursor.blockNumber()
         if block_number >= 0:
             self.line_clicked.emit(block_number)
+
+    @staticmethod
+    def _url_at_cursor(text: str, position: int) -> str | None:
+        for match in re.finditer(r"https?://\S+", text):
+            if match.start() <= position <= match.end():
+                return match.group(0).rstrip(".,);]")
+        return None
+
+    def url_text_format(self, url: str) -> QTextCharFormat:
+        link_format = QTextCharFormat()
+        if url in self._visited_urls:
+            link_format.setForeground(QColor("#7e3ff2"))
+        else:
+            link_format.setForeground(QColor("#1a73e8"))
+        link_format.setFontUnderline(True)
+        return link_format
+
+    def _mark_url_visited(self, url: str) -> None:
+        cursor = QTextCursor(self.document())
+        visited_format = self.url_text_format(url)
+
+        while True:
+            cursor = self.document().find(url, cursor)
+            if cursor.isNull():
+                break
+            cursor.mergeCharFormat(visited_format)
+
+        self.viewport().update()
 
     def paintEvent(self, event) -> None:  # noqa: N802
         super().paintEvent(event)
@@ -1652,17 +2028,32 @@ class MainWindow(QMainWindow):
         self.resolved_conflict_count = 0
         self.unsupported_count = 0
         self.failed_files: list[tuple[str, str]] = []
+        self.duplicate_stats: dict[str, int] = {
+            "scanned": 0,
+            "hashed": 0,
+            "hash_remaining": 0,
+            "compared": 0,
+            "compare_remaining": 0,
+            "matching": 0,
+        }
         self.completed_operations = 0
         self.total_operations = 0
         self.total_files = 0
         self.job_started_at: float | None = None
+        self.eta_started_at: float | None = None
+        self.eta_completed_base = 0
         self.stop_requested = False
         self.is_paused = False
         self.is_running = False
+        self.current_job_kind: str | None = None
         self.worker_thread: QThread | None = None
-        self.worker: UploadWorker | None = None
+        self.worker: UploadWorker | DuplicateCheckWorker | None = None
         self.find_dialog: FindDialog | None = None
         self.current_log_path: Path | None = None
+        self.auto_log_path: Path | None = None
+        self.auto_log_failed_path: Path | None = None
+        self.auto_log_failed = False
+        self.persistent_notices: dict[str, PersistentNotice] = {}
         self.connection_status_text = "Karakeep: Not configured"
         self.marker_metrics_update_scheduled = False
         self.highlighted_console_line: int | None = None
@@ -1675,6 +2066,9 @@ class MainWindow(QMainWindow):
         self.log_flush_timer.timeout.connect(self._flush_pending_logs)
 
         self.setWindowTitle(APP_NAME)
+        icon_path = Path(__file__).with_name("kkupload.ico")
+        if icon_path.exists():
+            self.setWindowIcon(QIcon(str(icon_path)))
         self.resize(900, 650)
         self.setAcceptDrops(True)
         self._create_menu_bar()
@@ -1686,6 +2080,9 @@ class MainWindow(QMainWindow):
 
         self.upload_button = QPushButton("Configure Upload")
         self.upload_button.clicked.connect(lambda: self._open_upload_dialog())
+
+        self.duplicate_check_button = QPushButton("Check Duplicates")
+        self.duplicate_check_button.clicked.connect(self._confirm_duplicate_check)
 
         self.pause_button = QPushButton("Pause")
         self.pause_button.setEnabled(False)
@@ -1709,6 +2106,7 @@ class MainWindow(QMainWindow):
         button_layout = QHBoxLayout()
         button_layout.addWidget(self.connection_settings_button)
         button_layout.addWidget(self.upload_button)
+        button_layout.addWidget(self.duplicate_check_button)
         button_layout.addSpacing(12)
         button_layout.addWidget(self.pause_button)
         button_layout.addWidget(self.stop_button)
@@ -1718,6 +2116,12 @@ class MainWindow(QMainWindow):
         self.console = StatusConsole(Path(__file__).with_name("naut.png"))
         self.console.setAcceptDrops(True)
         self.console.viewport().setAcceptDrops(True)
+        self.console.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        self.console.setMinimumWidth(0)
+        self.console.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
         self.console.installEventFilter(self)
         self.console.viewport().installEventFilter(self)
         self.console.line_clicked.connect(self._highlight_console_line)
@@ -1737,7 +2141,57 @@ class MainWindow(QMainWindow):
             lambda _size: self._schedule_console_marker_metrics_update()
         )
 
+        self.notice_bar = QWidget()
+        self.notice_bar.setVisible(False)
+        self.notice_bar.setStyleSheet(
+            """
+            QWidget {
+                background: #3b2f12;
+                border: 1px solid #a16207;
+                border-radius: 4px;
+            }
+            QLabel {
+                color: #fef3c7;
+                border: none;
+                background: transparent;
+            }
+            QPushButton {
+                background: #facc15;
+                color: #1f2937;
+                border: 1px solid #eab308;
+                border-radius: 4px;
+                padding: 3px 8px;
+            }
+            QPushButton:hover {
+                background: #fde047;
+            }
+            """
+        )
+        self.notice_label = QLabel("")
+        self.notice_label.setWordWrap(True)
+        self.notice_label.setMinimumWidth(0)
+        self.notice_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Preferred,
+        )
+        self.notice_retry_button = QPushButton("Retry")
+        self.notice_retry_button.clicked.connect(self._retry_auto_log_file)
+        self.notice_new_log_button = QPushButton("Start New Log File")
+        self.notice_new_log_button.clicked.connect(self._start_replacement_auto_log_file)
+
+        notice_layout = QHBoxLayout(self.notice_bar)
+        notice_layout.setContentsMargins(8, 6, 8, 6)
+        notice_layout.addWidget(self.notice_label, 1)
+        notice_layout.addWidget(self.notice_retry_button)
+        notice_layout.addWidget(self.notice_new_log_button)
+
         self.current_file_label = QLabel("Current file: —")
+        self.current_file_label.setMinimumWidth(0)
+        self.current_file_label.setWordWrap(True)
+        self.current_file_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Preferred,
+        )
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
@@ -1749,7 +2203,7 @@ class MainWindow(QMainWindow):
         self.summary_label.setTextFormat(Qt.TextFormat.RichText)
         self.summary_label.setMinimumWidth(0)
         self.summary_label.setSizePolicy(
-            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Ignored,
             QSizePolicy.Policy.Fixed,
         )
         self.clear_console_button = QPushButton("Clear Console")
@@ -1762,6 +2216,7 @@ class MainWindow(QMainWindow):
         central_widget = QWidget()
         layout = QVBoxLayout(central_widget)
         layout.addLayout(button_layout)
+        layout.addWidget(self.notice_bar)
 
         console_layout = QHBoxLayout()
         console_layout.setContentsMargins(0, 0, 0, 0)
@@ -1779,6 +2234,7 @@ class MainWindow(QMainWindow):
         self._restore_window_state()
         self._update_connection_state()
         self._update_summary()
+        self._start_auto_log_file()
         self._log("KKUpload ready.")
         for message, level in preference_load_result.messages:
             self._log(message, level=level)
@@ -1788,11 +2244,14 @@ class MainWindow(QMainWindow):
         file_menu = self.menuBar().addMenu("&File")
 
         configure_upload_action = QAction("Configure Upload", self)
-        configure_upload_action.setShortcut("Ctrl+U")
         configure_upload_action.triggered.connect(
             lambda: self._open_upload_dialog()
         )
         file_menu.addAction(configure_upload_action)
+
+        check_duplicates_action = QAction("Check Duplicates", self)
+        check_duplicates_action.triggered.connect(self._confirm_duplicate_check)
+        file_menu.addAction(check_duplicates_action)
 
         pause_action = QAction("Pause / Unpause", self)
         pause_action.setShortcut("Ctrl+Space")
@@ -1800,11 +2259,6 @@ class MainWindow(QMainWindow):
         file_menu.addAction(pause_action)
 
         file_menu.addSeparator()
-
-        save_log_action = QAction("Save Log", self)
-        save_log_action.setShortcut("Ctrl+S")
-        save_log_action.triggered.connect(self._save_log)
-        file_menu.addAction(save_log_action)
 
         save_log_as_action = QAction("Save Log As...", self)
         save_log_as_action.setShortcut("Ctrl+Shift+S")
@@ -1954,8 +2408,145 @@ class MainWindow(QMainWindow):
 
         self.preferences = dialog.preferences
         self._apply_view_mode(self.preferences.view_mode)
+        self._start_auto_log_file()
         self._log(f"Preferences saved: {path}", level="SUCCESS")
         return True
+
+    def _start_auto_log_file(self) -> None:
+        self.auto_log_failed = False
+        self.auto_log_failed_path = None
+        self._clear_persistent_notice("auto-log-failed")
+        log_folder = self._resolve_log_folder(self.preferences.log_folder)
+        log_path = self._new_auto_log_path(log_folder)
+
+        try:
+            log_folder.mkdir(parents=True, exist_ok=True)
+            log_path.write_text("", encoding="utf-8")
+        except OSError as exc:
+            self.auto_log_path = None
+            self._set_auto_log_failed(log_path)
+            self._log(
+                f"Automatic log file could not be created: {log_path} ({exc})",
+                level="ERROR",
+                message_color="ERROR",
+            )
+            return
+
+        self.auto_log_path = log_path
+        self._log(
+            f"Automatic log file: {log_path}",
+            level="SUCCESS",
+            message_color="SUCCESS",
+        )
+
+    @staticmethod
+    def _new_auto_log_path(log_folder: Path) -> Path:
+        return (
+            log_folder
+            / f"kkupload-log-{datetime.now().strftime('%Y%m%d-%H%M%S')}.txt"
+        )
+
+    def _retry_auto_log_file(self) -> None:
+        if self.auto_log_failed_path is None:
+            self._start_replacement_auto_log_file()
+            return
+
+        log_path = self.auto_log_failed_path
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with log_path.open("a", encoding="utf-8"):
+                pass
+        except OSError as exc:
+            self._set_auto_log_failed(log_path)
+            self._log(
+                f"Automatic log file retry failed: {log_path} ({exc})",
+                level="ERROR",
+                message_color="ERROR",
+            )
+            return
+
+        self.auto_log_path = log_path
+        self.auto_log_failed = False
+        self.auto_log_failed_path = None
+        self._clear_persistent_notice("auto-log-failed")
+        self._log(
+            f"Automatic log file writing resumed: {log_path}",
+            level="SUCCESS",
+            message_color="SUCCESS",
+        )
+
+    def _start_replacement_auto_log_file(self) -> None:
+        log_folder = self._resolve_log_folder(self.preferences.log_folder)
+        log_path = self._new_auto_log_path(log_folder)
+        console_text = self.console.toPlainText()
+        if console_text and not console_text.endswith("\n"):
+            console_text += "\n"
+
+        try:
+            log_folder.mkdir(parents=True, exist_ok=True)
+            log_path.write_text(console_text, encoding="utf-8")
+        except OSError as exc:
+            self.auto_log_path = None
+            self._set_auto_log_failed(log_path)
+            self._log(
+                f"Replacement automatic log file could not be created: "
+                f"{log_path} ({exc})",
+                level="ERROR",
+                message_color="ERROR",
+            )
+            return
+
+        self.auto_log_path = log_path
+        self.auto_log_failed = False
+        self.auto_log_failed_path = None
+        self._clear_persistent_notice("auto-log-failed")
+        self._log(
+            f"Automatic log file restarted: {log_path}",
+            level="SUCCESS",
+            message_color="SUCCESS",
+        )
+
+    def _set_auto_log_failed(self, log_path: Path) -> None:
+        self.auto_log_failed = True
+        self.auto_log_failed_path = log_path
+        self._set_persistent_notice(
+            PersistentNotice(
+                key="auto-log-failed",
+                message=(
+                    "Automatic file logging is off. Retry the current log file, "
+                    "or start a new log file using the current console contents."
+                ),
+            )
+        )
+
+    def _set_persistent_notice(self, notice: PersistentNotice) -> None:
+        self.persistent_notices[notice.key] = notice
+        self._update_notice_bar()
+
+    def _clear_persistent_notice(self, key: str) -> None:
+        if key in self.persistent_notices:
+            del self.persistent_notices[key]
+        self._update_notice_bar()
+
+    def _update_notice_bar(self) -> None:
+        if not self.persistent_notices:
+            self.notice_bar.setVisible(False)
+            self.notice_label.setText("")
+            return
+
+        notice = next(iter(self.persistent_notices.values()))
+        self.notice_label.setText(notice.message)
+        is_auto_log_notice = notice.key == "auto-log-failed"
+        self.notice_retry_button.setVisible(is_auto_log_notice)
+        self.notice_new_log_button.setVisible(is_auto_log_notice)
+        self.notice_bar.setVisible(True)
+
+    @staticmethod
+    def _resolve_log_folder(log_folder: str) -> Path:
+        path = Path(log_folder).expanduser()
+        if path.is_absolute():
+            return path
+        return Path(__file__).resolve().parent / path
 
     def _apply_view_mode(self, view_mode: str) -> None:
         app = QApplication.instance()
@@ -2209,9 +2800,7 @@ class MainWindow(QMainWindow):
     def _show_keyboard_shortcuts(self) -> None:
         message = (
             "<table>"
-            "<tr><td><b>Configure Upload</b></td><td>&nbsp;&nbsp;Ctrl+U</td></tr>"
             "<tr><td><b>Pause / Unpause</b></td><td>&nbsp;&nbsp;Ctrl+Space</td></tr>"
-            "<tr><td><b>Save Log</b></td><td>&nbsp;&nbsp;Ctrl+S</td></tr>"
             "<tr><td><b>Save Log As</b></td><td>&nbsp;&nbsp;Ctrl+Shift+S</td></tr>"
             "<tr><td><b>Find</b></td><td>&nbsp;&nbsp;Ctrl+F</td></tr>"
             "<tr><td><b>Prev Issue</b></td><td>&nbsp;&nbsp;Ctrl+Comma</td></tr>"
@@ -2252,6 +2841,7 @@ class MainWindow(QMainWindow):
         has_settings = self._has_connection_settings()
         self.connection_settings_button.setEnabled(not self.is_running)
         self.upload_button.setEnabled(has_settings and not self.is_running)
+        self.duplicate_check_button.setEnabled(has_settings and not self.is_running)
 
         if has_settings:
             server_url = str(
@@ -2375,6 +2965,132 @@ class MainWindow(QMainWindow):
         self.configuration = dialog.configuration
         self._start_upload_job()
 
+    def _confirm_duplicate_check(self) -> None:
+        if not self._has_connection_settings():
+            self._log("Configure Karakeep connection settings before checking duplicates.")
+            self._open_connection_settings()
+            return
+
+        dialog = DuplicateCheckDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            self._log("Duplicate check canceled.")
+            return
+
+        if dialog.options is None:
+            self._log("Duplicate check options were not returned.")
+            return
+
+        self._start_duplicate_check_job(dialog.options)
+
+    def _start_duplicate_check_job(self, options: DuplicateCheckOptions) -> None:
+        server_url = str(
+            self.settings.value("connection/server_url", "") or ""
+        ).strip()
+
+        try:
+            api_key = (
+                keyring.get_password(KEYRING_SERVICE, KEYRING_USERNAME)
+                or ""
+            )
+        except keyring.errors.KeyringError as exc:
+            self._log(f"Unable to read API key: {exc}", level="ERROR")
+            return
+
+        self._log(
+            "================================",
+            message_color="START",
+            include_level=False,
+        )
+        self._log("STARTING DUPLICATE CHECK.", message_color="START")
+        self._log(
+            "================================",
+            message_color="START",
+            include_level=False,
+        )
+
+        self.configuration = None
+        self.current_index = 0
+        self.succeeded_count = 0
+        self.failed_count = 0
+        self.not_processed_count = 0
+        self.resolved_conflict_count = 0
+        self.unsupported_count = 0
+        self.failed_files = []
+        self.duplicate_stats = {
+            "scanned": 0,
+            "hashed": 0,
+            "hash_remaining": 0,
+            "compared": 0,
+            "compare_remaining": 0,
+            "matching": 0,
+        }
+        self.pending_dry_run_estimate_lines = []
+        self.completed_operations = 0
+        self.total_operations = 0
+        self.total_files = 0
+        self.job_started_at = time.monotonic()
+        self.stop_requested = False
+        self.is_paused = False
+        self.is_running = True
+        self.current_job_kind = "duplicates"
+
+        self.upload_button.setEnabled(False)
+        self.duplicate_check_button.setEnabled(False)
+        self.connection_settings_button.setEnabled(False)
+        self.pause_button.setEnabled(True)
+        self.pause_button.setText("Pause")
+        self.stop_button.setEnabled(True)
+        self.clear_console_button.setEnabled(False)
+
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.setValue(0)
+        self.current_file_label.setText("Current operation: preparing duplicate scan...")
+        self._update_summary()
+        self._log(f"Karakeep server: {server_url}")
+        self._log("Duplicate tags: POTENTIAL_DUPLICATE and PD: X")
+        self._log(
+            "Duplicate options: "
+            f"rescan={'yes' if options.rescan else 'no'}, "
+            "aggressive clearing="
+            f"{'yes' if options.aggressive_duplicate_clearing else 'no'}, "
+            f"union lists={'yes' if options.replicate_lists else 'no'}, "
+            f"union tags={'yes' if options.replicate_tags else 'no'}, "
+            f"cull redundant={'yes' if options.auto_cull else 'no'}, "
+            "clean resolved tags="
+            f"{'yes' if options.cleanup_resolved_duplicate_tags else 'no'}."
+        )
+
+        job_config = DuplicateCheckConfig(
+            server_url=server_url,
+            api_key=api_key,
+            rescan=options.rescan,
+            aggressive_duplicate_clearing=options.aggressive_duplicate_clearing,
+            replicate_lists=options.replicate_lists,
+            replicate_tags=options.replicate_tags,
+            auto_cull=options.auto_cull,
+            cleanup_resolved_duplicate_tags=(
+                options.cleanup_resolved_duplicate_tags
+            ),
+        )
+
+        self.worker_thread = QThread(self)
+        self.worker = DuplicateCheckWorker(job_config)
+        self.worker.moveToThread(self.worker_thread)
+
+        self.worker_thread.started.connect(self.worker.run)
+        self.worker.log.connect(self._handle_worker_log)
+        self.worker.progress_range.connect(self._set_progress_range)
+        self.worker.progress.connect(self._set_progress)
+        self.worker.stats.connect(self._handle_duplicate_stats)
+        self.worker.pause_requested.connect(self._handle_worker_pause_requested)
+        self.worker.finished.connect(self._finish_batch)
+        self.worker.finished.connect(self.worker_thread.quit)
+        self.worker.finished.connect(self.worker.deleteLater)
+        self.worker_thread.finished.connect(self.worker_thread.deleteLater)
+        self.worker_thread.finished.connect(self._clear_worker_references)
+
+        self.worker_thread.start()
+
     def _start_upload_job(self) -> None:
         config = self.configuration
         if config is None:
@@ -2438,8 +3154,10 @@ class MainWindow(QMainWindow):
         self.stop_requested = False
         self.is_paused = False
         self.is_running = True
+        self.current_job_kind = "upload"
 
         self.upload_button.setEnabled(False)
+        self.duplicate_check_button.setEnabled(False)
         self.connection_settings_button.setEnabled(False)
         self.pause_button.setEnabled(True)
         self.pause_button.setText("Pause")
@@ -2548,6 +3266,9 @@ class MainWindow(QMainWindow):
             default_tags=config.default_tags,
             dry_run=config.dry_run,
             omit_top_folder_list=config.omit_top_folder_list,
+            remove_empty_subfolders_after_upload=(
+                config.remove_empty_subfolders_after_upload
+            ),
             image_resize_preferences=self.preferences.image_resize,
             timing_stats_path=default_timing_stats_path(Path(__file__)),
         )
@@ -2564,6 +3285,7 @@ class MainWindow(QMainWindow):
         self.worker.conflict_resolved.connect(self._handle_conflict_resolved)
         self.worker.unsupported_found.connect(self._handle_unsupported_found)
         self.worker.failed_file.connect(self._handle_failed_file)
+        self.worker.pause_requested.connect(self._handle_worker_pause_requested)
         self.worker.finished.connect(self._finish_batch)
         self.worker.finished.connect(self.worker_thread.quit)
         self.worker.finished.connect(self.worker.deleteLater)
@@ -2620,11 +3342,41 @@ class MainWindow(QMainWindow):
         self.unsupported_count = count
         self._update_summary()
 
+    def _handle_duplicate_stats(self, stats: object) -> None:
+        if not isinstance(stats, dict):
+            return
+
+        for key in self.duplicate_stats:
+            value = stats.get(key)
+            if isinstance(value, int):
+                self.duplicate_stats[key] = value
+        self._update_summary()
+
+    def _handle_worker_pause_requested(self, reason: str) -> None:
+        if not self.is_running or self.stop_requested:
+            return
+
+        self.is_paused = True
+        self.pause_button.setText("Unpause")
+        self.current_file_label.setText("Current operation: paused")
+        self._update_summary()
+
     def _set_progress_range(self, total_operations: int, total_files: int) -> None:
+        previous_completed_operations = self.completed_operations
         self.total_operations = total_operations
         self.total_files = total_files
         self.progress_bar.setRange(0, total_operations)
         self.progress_bar.setValue(0)
+        if total_operations > 0:
+            self.eta_started_at = time.monotonic()
+            self.eta_completed_base = (
+                0
+                if previous_completed_operations > total_operations
+                else previous_completed_operations
+            )
+        else:
+            self.eta_started_at = None
+            self.eta_completed_base = 0
         self._update_summary()
 
     def _set_progress(
@@ -2652,21 +3404,22 @@ class MainWindow(QMainWindow):
 
         if self.is_paused:
             self.pause_button.setText("Unpause")
-            self.current_file_label.setText("Current file: paused")
+            self.current_file_label.setText("Current operation: paused")
             self._log(
-                "Pause requested. No new files will start until unpaused.",
+                "Pause requested. No new operations will start until unpaused.",
                 level="WARNING",
             )
         else:
             self.pause_button.setText("Pause")
-            self._log("Upload batch unpaused.")
+            self._log(f"{self._current_job_label()} unpaused.")
 
     def _request_stop(self) -> None:
         if not self.is_running:
             return
 
         if (
-            self.configuration is not None
+            self.current_job_kind == "upload"
+            and self.configuration is not None
             and not self.configuration.dry_run
             and self.configuration.dont_move_completed
             and not self._confirm_stop_with_completed_files_left_in_place()
@@ -2681,7 +3434,7 @@ class MainWindow(QMainWindow):
         self.stop_button.setEnabled(False)
         self.stop_button.setText("Stopping...")
         self._log(
-            "Stop requested. The batch will stop at "
+            "Stop requested. The current job will stop at "
             "the next safe checkpoint.",
             level="WARNING",
         )
@@ -2747,13 +3500,24 @@ class MainWindow(QMainWindow):
         self.resolved_conflict_count = 0
         self.unsupported_count = 0
         self.failed_files.clear()
+        self.duplicate_stats = {
+            "scanned": 0,
+            "hashed": 0,
+            "hash_remaining": 0,
+            "compared": 0,
+            "compare_remaining": 0,
+            "matching": 0,
+        }
         self.completed_operations = 0
         self.total_operations = 0
         self.total_files = 0
         self.job_started_at = None
+        self.eta_started_at = None
+        self.eta_completed_base = 0
         self.current_file_label.setText("Current file: -")
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
+        self.current_job_kind = None
         self.console.setExtraSelections([])
         self._update_summary()
         self._write_pending_finish_if_ready()
@@ -2788,7 +3552,18 @@ class MainWindow(QMainWindow):
         self.worker_thread = None
         self._write_pending_finish_if_ready()
 
+    def _current_job_label(self) -> str:
+        if self.current_job_kind == "duplicates":
+            return "Duplicate check"
+        if self.current_job_kind == "upload":
+            return "Upload batch"
+        return "Current job"
+
     def _update_summary(self) -> None:
+        if self.current_job_kind == "duplicates":
+            self._update_duplicate_summary()
+            return
+
         remaining = max(
             self.total_files - self.current_index,
             0,
@@ -2814,13 +3589,41 @@ class MainWindow(QMainWindow):
             f"<span style='color: {eta_color};'>ETA: {eta_text}</span>"
         )
 
+    def _update_duplicate_summary(self) -> None:
+        colors = self._console_log_colors()
+        eta_text = self._format_eta()
+        eta_color = colors["timestamp"]
+        matching_text = self._format_warning_count(self.duplicate_stats["matching"])
+        total_hashable = (
+            self.duplicate_stats["hashed"]
+            + self.duplicate_stats["hash_remaining"]
+        )
+        total_comparable = (
+            self.duplicate_stats["compared"]
+            + self.duplicate_stats["compare_remaining"]
+        )
+
+        self.summary_label.setText(
+            f"Scanned: {self.duplicate_stats['scanned']}&nbsp;&nbsp;&nbsp;&nbsp;"
+            f"Hashed: {self.duplicate_stats['hashed']} / {total_hashable}"
+            "&nbsp;&nbsp;&nbsp;&nbsp;"
+            f"Compared: {self.duplicate_stats['compared']} / {total_comparable}"
+            "&nbsp;&nbsp;&nbsp;&nbsp;"
+            f"Matching: {matching_text}&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"
+            f"<span style='color: {eta_color};'>ETA: {eta_text}</span>"
+        )
+
     def _format_eta(self) -> str:
         if (
             not self.is_running
             or self.job_started_at is None
-            or self.completed_operations <= 0
+            or self.eta_started_at is None
             or self.total_operations <= 0
         ):
+            return "--"
+
+        completed_in_eta_window = self.completed_operations - self.eta_completed_base
+        if completed_in_eta_window <= 0:
             return "--"
 
         remaining_operations = max(
@@ -2830,8 +3633,8 @@ class MainWindow(QMainWindow):
         if remaining_operations <= 0:
             return "00:00"
 
-        elapsed = max(time.monotonic() - self.job_started_at, 0.1)
-        seconds_per_operation = elapsed / self.completed_operations
+        elapsed = max(time.monotonic() - self.eta_started_at, 0.1)
+        seconds_per_operation = elapsed / completed_in_eta_window
         remaining_seconds = int(round(seconds_per_operation * remaining_operations))
         return self._format_duration(remaining_seconds)
 
@@ -2868,6 +3671,16 @@ class MainWindow(QMainWindow):
         self,
         include_not_processed: bool = False,
     ) -> None:
+        if self.current_job_kind == "duplicates":
+            self._log(f"Potential duplicate groups: {self.succeeded_count}")
+            if self.failed_count > 0:
+                self._log(
+                    f"Duplicate check errors: {self.failed_count}",
+                    message_color="ERROR",
+                )
+            self._log_blank_lines(2)
+            return
+
         total = self.total_files
         self._log(f"Successful: {self.succeeded_count} / {total}")
 
@@ -2907,6 +3720,7 @@ class MainWindow(QMainWindow):
         for _ in range(count):
             cursor.insertBlock()
 
+        self._append_auto_log_text("\n" * count)
         self._schedule_console_marker_metrics_update()
         if should_auto_scroll:
             scrollbar = self.console.verticalScrollBar()
@@ -2945,9 +3759,11 @@ class MainWindow(QMainWindow):
         self.pending_finish_stopped = None
 
         if stopped:
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(0)
             self.current_file_label.setText("Current file: stopped")
             self._log(
-                "UPLOAD BATCH STOPPED!",
+                f"{self._current_job_label().upper()} STOPPED!",
                 level="WARNING",
                 message_color="WARNING",
             )
@@ -2955,12 +3771,17 @@ class MainWindow(QMainWindow):
             self._log_completion_summary(include_not_processed=True)
             self.clear_console_button.setEnabled(True)
         else:
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(100)
             self.current_file_label.setText("Current file: complete")
-            complete_message = (
-                "DRY-RUN COMPLETE!"
-                if self.configuration is not None and self.configuration.dry_run
-                else "UPLOAD BATCH COMPLETE!"
-            )
+            if self.current_job_kind == "duplicates":
+                complete_message = "DUPLICATE CHECK COMPLETE!"
+            else:
+                complete_message = (
+                    "DRY-RUN COMPLETE!"
+                    if self.configuration is not None and self.configuration.dry_run
+                    else "UPLOAD BATCH COMPLETE!"
+                )
             self._log(
                 complete_message,
                 level="SUCCESS",
@@ -2969,6 +3790,8 @@ class MainWindow(QMainWindow):
             self._log(f"Total time: {self._format_total_elapsed_time()}")
             self._log_completion_summary()
             self.clear_console_button.setEnabled(True)
+
+        self.current_job_kind = None
 
     def _log(
         self,
@@ -3010,12 +3833,14 @@ class MainWindow(QMainWindow):
 
         if message.startswith("###### "):
             cursor.insertText("###### ", timestamp_format)
-            cursor.insertText(
+            self._insert_console_message_text(
+                cursor,
                 message.removeprefix("###### "),
                 message_format if message_color is not None else default_format,
             )
         else:
-            cursor.insertText(
+            self._insert_console_message_text(
+                cursor,
                 message,
                 message_format if message_color is not None else default_format,
             )
@@ -3025,10 +3850,76 @@ class MainWindow(QMainWindow):
         if marker_type is not None:
             self.console_marker_rail.add_marker(total_lines - 1, marker_type)
         self._schedule_console_marker_metrics_update()
+        self._append_auto_log_text(
+            self._format_log_line(
+                message,
+                timestamp=timestamp,
+                level=level,
+                include_prefix=include_prefix,
+                include_level=include_level,
+            )
+            + "\n"
+        )
 
         if should_auto_scroll:
             scrollbar = self.console.verticalScrollBar()
             scrollbar.setValue(scrollbar.maximum())
+
+    @staticmethod
+    def _format_log_line(
+        message: str,
+        *,
+        timestamp: str,
+        level: str,
+        include_prefix: bool,
+        include_level: bool,
+    ) -> str:
+        if not include_prefix:
+            return message
+        if include_level:
+            return f"[{timestamp}] [{level}] {message}"
+        return f"[{timestamp}] {message}"
+
+    def _append_auto_log_text(self, text: str) -> None:
+        if self.auto_log_path is None or self.auto_log_failed:
+            return
+
+        try:
+            with self.auto_log_path.open("a", encoding="utf-8") as handle:
+                handle.write(text)
+        except OSError as exc:
+            failed_path = self.auto_log_path
+            self.auto_log_path = None
+            self._set_auto_log_failed(failed_path)
+            self._log(
+                "Automatic log file write failed: "
+                f"{failed_path} ({exc}). Use the warning above the console to "
+                "retry logging or start a new automatic log file.",
+                level="ERROR",
+                message_color="ERROR",
+            )
+
+    def _insert_console_message_text(
+        self,
+        cursor: QTextCursor,
+        message: str,
+        base_format: QTextCharFormat,
+    ) -> None:
+        position = 0
+        for match in re.finditer(r"https?://\S+", message):
+            if match.start() > position:
+                cursor.insertText(message[position:match.start()], base_format)
+
+            raw_url = match.group(0)
+            url = raw_url.rstrip(".,);]")
+            trailing = raw_url[len(url):]
+            cursor.insertText(url, self.console.url_text_format(url))
+            if trailing:
+                cursor.insertText(trailing, base_format)
+            position = match.end()
+
+        if position < len(message):
+            cursor.insertText(message[position:], base_format)
 
     def _console_should_auto_scroll(self) -> bool:
         scrollbar = self.console.verticalScrollBar()
@@ -3255,9 +4146,22 @@ class MainWindow(QMainWindow):
 def main() -> int:
     global DEFAULT_APP_PALETTE
 
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                APP_USER_MODEL_ID
+            )
+        except Exception:
+            pass
+
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setOrganizationName(ORGANIZATION_NAME)
+    icon_path = Path(__file__).with_name("kkupload.ico")
+    if icon_path.exists():
+        app.setWindowIcon(QIcon(str(icon_path)))
     DEFAULT_APP_PALETTE = app.palette()
 
     window = MainWindow()
