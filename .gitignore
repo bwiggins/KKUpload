@@ -2,6 +2,12 @@
 __pycache__/
 *.pyc
 settings.json
+<<<<<<< Updated upstream
+=======
+preferences.json
+timing_stats.json
+KKUpload.lnk
+>>>>>>> Stashed changes
 logs/
 dist/
 build/

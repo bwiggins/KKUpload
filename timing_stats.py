@@ -6,8 +6,12 @@ import json
 from pathlib import Path
 from typing import Any
 
+from app_paths import user_data_dir
+
 
 TIMING_STATS_FILE_NAME = "timing_stats.json"
+
+
 @dataclass(frozen=True)
 class UploadTimingSample:
     completed_at: str
@@ -28,7 +32,8 @@ class UploadTimeEstimate:
 
 
 def default_timing_stats_path(app_path: Path) -> Path:
-    return app_path.with_name(TIMING_STATS_FILE_NAME)
+    del app_path
+    return user_data_dir() / TIMING_STATS_FILE_NAME
 
 
 def new_upload_timing_sample(
@@ -50,6 +55,7 @@ def new_upload_timing_sample(
 
 
 def record_upload_timing(path: Path, sample: UploadTimingSample) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(
             {"samples": [_sample_to_json(sample)]},

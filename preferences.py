@@ -1,9 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 from pathlib import Path
+import shutil
 from typing import Any
+
+from app_paths import default_log_dir, user_data_dir
 
 
 PREFERENCES_FILE_NAME = "preferences.json"
@@ -36,6 +39,10 @@ class ImageResizePreferences:
 class AppPreferences:
     image_resize: ImageResizePreferences
     view_mode: str = "auto"
+<<<<<<< Updated upstream
+=======
+    log_folder: str = field(default_factory=lambda: str(default_log_dir()))
+>>>>>>> Stashed changes
 
 
 @dataclass(frozen=True)
@@ -45,11 +52,15 @@ class PreferenceLoadResult:
 
 
 def default_preferences() -> AppPreferences:
-    return AppPreferences(image_resize=ImageResizePreferences())
+    return AppPreferences(
+        image_resize=ImageResizePreferences(),
+        log_folder=str(default_log_dir()),
+    )
 
 
 def preferences_path(app_path: Path) -> Path:
-    return app_path.with_name(PREFERENCES_FILE_NAME)
+    del app_path
+    return user_data_dir() / PREFERENCES_FILE_NAME
 
 
 def save_preferences(app_path: Path, preferences: AppPreferences) -> Path:
@@ -63,6 +74,24 @@ def load_preferences(app_path: Path) -> PreferenceLoadResult:
     defaults = default_preferences()
     messages: list[tuple[str, str]] = []
     rewrite_needed = False
+    migrated_legacy_preferences = False
+
+    legacy_path = app_path.with_name(PREFERENCES_FILE_NAME)
+    if not path.exists() and legacy_path.exists() and legacy_path != path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(legacy_path, path)
+        try:
+            legacy_path.unlink()
+            migration_action = "Moved"
+        except OSError:
+            migration_action = "Copied"
+        messages.append(
+            (
+                f"{migration_action} legacy preferences to: {path}",
+                "INFO",
+            )
+        )
+        migrated_legacy_preferences = True
 
     if not path.exists():
         _write_preferences(path, defaults)
@@ -116,7 +145,19 @@ def load_preferences(app_path: Path) -> PreferenceLoadResult:
     )
     messages.extend(validation_messages)
     view_mode = _view_mode_value(raw, "view_mode", defaults.view_mode, messages)
+<<<<<<< Updated upstream
     preferences = AppPreferences(image_resize=image_resize, view_mode=view_mode)
+=======
+    log_folder = _log_folder_value(raw, "log_folder", defaults.log_folder, messages)
+    if migrated_legacy_preferences and log_folder == "logs":
+        log_folder = defaults.log_folder
+        rewrite_needed = True
+    preferences = AppPreferences(
+        image_resize=image_resize,
+        view_mode=view_mode,
+        log_folder=log_folder,
+    )
+>>>>>>> Stashed changes
 
     if (
         validation_messages
@@ -299,6 +340,7 @@ def _view_mode_value(
 
 
 def _write_preferences(path: Path, preferences: AppPreferences) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(_preferences_to_json(preferences), indent=2) + "\n",
         encoding="utf-8",
